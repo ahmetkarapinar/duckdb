@@ -11,7 +11,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include <iostream>
+
 namespace duckdb {
 
 using ValidityBytes = JoinHashTable::ValidityBytes;
@@ -1138,12 +1138,12 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 					result.SetCardinality(result_count);
 
 					if (ht.use_dict_emission) {
-						// Build selection vector of dictionary indices via hash map lookup
+						// Build selection vector of dictionary indices via pointer arithmetic
 						SelectionVector build_sel_vec(result_count);
 						auto ptrs = FlatVector::GetData<data_ptr_t>(pointers);
 						for (idx_t i = 0; i < result_count; i++) {
 							auto idx = chain_match_sel_vector.get_index(i);
-							build_sel_vec.set_index(i, ht.ptr_to_dict_idx.at(ptrs[idx]));
+							build_sel_vec.set_index(i, ht.PtrToDictIdx(ptrs[idx]));
 						}
 						for (idx_t i = 0; i < ht.output_columns.size(); i++) {
 							auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
@@ -1181,11 +1181,11 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		result.SetCardinality(base_count);
 
 		if (ht.use_dict_emission) {
-			// Convert buffered rhs_pointers to dictionary indices via hash map lookup
+			// Convert buffered rhs_pointers to dictionary indices via pointer arithmetic
 			SelectionVector build_sel_vec(base_count);
 			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
 			for (idx_t i = 0; i < base_count; i++) {
-				build_sel_vec.set_index(i, ht.ptr_to_dict_idx.at(rhs_ptrs[i]));
+				build_sel_vec.set_index(i, ht.PtrToDictIdx(rhs_ptrs[i]));
 			}
 			for (idx_t i = 0; i < ht.output_columns.size(); i++) {
 				auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
@@ -1608,7 +1608,7 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 		SelectionVector build_sel_vec(found_entries);
 		auto key_locs = FlatVector::GetData<data_ptr_t>(addresses);
 		for (idx_t j = 0; j < found_entries; j++) {
-			build_sel_vec.set_index(j, ptr_to_dict_idx.at(key_locs[j]));
+			build_sel_vec.set_index(j, PtrToDictIdx(key_locs[j]));
 		}
 		for (idx_t i = 0; i < output_columns.size(); i++) {
 			auto &vector = result.data[left_column_count + i];
@@ -1691,12 +1691,23 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	} while (iterator.Next());
 	D_ASSERT(total == build_count);
 
-	// Step 2: Build pointer-to-index map for O(1) lookup during probe
-	ptr_to_dict_idx.clear();
-	ptr_to_dict_idx.reserve(build_count);
-	for (idx_t i = 0; i < build_count; i++) {
-		ptr_to_dict_idx[row_ptrs[i]] = i;
+	// Step 2: Build block directory for pointer-arithmetic-based index lookup.
+	// Rows within a TupleDataChunkPart are contiguous at stride row_width.
+	// We detect contiguous runs and record one directory entry per run.
+	dict_row_width = layout_ptr->GetRowWidth();
+	D_ASSERT(dict_row_width > 0);
+	dict_block_directory.clear();
+	dict_block_directory.push_back({row_ptrs[0], 0});
+	for (idx_t i = 1; i < build_count; i++) {
+		if (row_ptrs[i] != row_ptrs[i - 1] + dict_row_width) {
+			dict_block_directory.push_back({row_ptrs[i], i});
+		}
 	}
+	// Sort by base_ptr — required for binary search in PtrToDictIdx.
+	// Row pointers from the iterator are in logical (chunk/part) order,
+	// which is not necessarily ascending by address.
+	std::sort(dict_block_directory.begin(), dict_block_directory.end(),
+	          [](const DictBlockEntry &a, const DictBlockEntry &b) { return a.base_ptr < b.base_ptr; });
 
 	// Step 3: Create dictionary arrays — one per output column
 	const auto &sel = *FlatVector::IncrementalSelectionVector();

@@ -20,7 +20,7 @@
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/planner/filter/bloom_filter.hpp"
 
-#include <unordered_map>
+#include <algorithm>
 
 namespace duckdb {
 
@@ -328,8 +328,29 @@ public:
 	//! Indexed in the same order as output_columns
 	vector<buffer_ptr<VectorChildBuffer>> dict_arrays;
 
-	//! Map from row pointer to dictionary index for O(1) lookup during probe
-	unordered_map<data_ptr_t, idx_t> ptr_to_dict_idx;
+	//! Block directory for pointer-arithmetic-based index lookup.
+	//! Each entry records the base pointer of a contiguous row run and the
+	//! cumulative dictionary index at which that run starts. Sorted by base_ptr
+	//! so that lookup is a binary search + integer division.
+	struct DictBlockEntry {
+		data_ptr_t base_ptr; //!< First row pointer in this contiguous run
+		idx_t start_idx;     //!< Dictionary index of the first row in this run
+	};
+	vector<DictBlockEntry> dict_block_directory;
+	idx_t dict_row_width = 0;
+
+	//! Convert a row pointer to its dictionary index using pointer arithmetic.
+	//! Binary search over the (tiny) block directory followed by one division.
+	inline idx_t PtrToDictIdx(data_ptr_t ptr) const {
+		auto it = std::upper_bound(
+		    dict_block_directory.begin(), dict_block_directory.end(), ptr,
+		    [](data_ptr_t p, const DictBlockEntry &e) { return p < e.base_ptr; });
+		D_ASSERT(it != dict_block_directory.begin());
+		--it;
+		D_ASSERT(ptr >= it->base_ptr);
+		D_ASSERT((ptr - it->base_ptr) % dict_row_width == 0);
+		return it->start_idx + static_cast<idx_t>(ptr - it->base_ptr) / dict_row_width;
+	}
 
 	struct {
 		mutex mj_lock;

@@ -22,9 +22,9 @@ Added because `BuildDictionaryArrays` takes a `const PhysicalHashJoin &` paramet
 
 **Include** (line ~23):
 ```cpp
-#include <unordered_map>
+#include <algorithm>
 ```
-Required for `std::unordered_map<data_ptr_t, idx_t>` used for the pointer-to-dictionary-index lookup.
+Required for `std::upper_bound` used in the `PtrToDictIdx` inline method and `std::sort` used in `BuildDictionaryArrays`.
 
 **Public method declaration** (line ~226):
 ```cpp
@@ -38,7 +38,10 @@ The method that pre-materializes build-side data into dictionary arrays during f
 |--------|------|---------|
 | `use_dict_emission` | `bool` (default `false`) | Gate flag checked at every probe emission site |
 | `dict_arrays` | `vector<buffer_ptr<VectorChildBuffer>>` | Pre-materialized columnar data for each RHS output column. Each entry is a reusable dictionary buffer created via `DictionaryVector::CreateReusableDictionary`. Indexed in the same order as `output_columns`. |
-| `ptr_to_dict_idx` | `unordered_map<data_ptr_t, idx_t>` | Maps each build-side row pointer to its 0-based dictionary index for O(1) lookup during probe |
+| `DictBlockEntry` | `struct { data_ptr_t base_ptr; idx_t start_idx; }` | Represents one contiguous memory block of rows |
+| `dict_block_directory` | `vector<DictBlockEntry>` | Sorted array (by `base_ptr`) mapping contiguous row-memory blocks to their starting dictionary index. Typically 1–10 entries. |
+| `dict_row_width` | `idx_t` (default `0`) | Cached value of `layout_ptr->GetRowWidth()`, used for pointer arithmetic |
+| `PtrToDictIdx(data_ptr_t)` | `inline idx_t` method | Converts a row pointer to its dictionary index via binary search + pointer arithmetic |
 
 **Constant** (line ~476):
 ```cpp
@@ -53,7 +56,7 @@ Three-step process:
 
 1. **Scan row locations**: Uses `TupleDataChunkIterator` with `KEEP_EVERYTHING_PINNED` to collect all `data_ptr_t` row pointers from the `TupleDataCollection` into a contiguous `Vector`.
 
-2. **Build pointer-to-index map**: Populates an `unordered_map<data_ptr_t, idx_t>` mapping each row pointer to its 0-based dictionary index. This map is used during probe to convert matched row pointers into selection vector indices for dictionary emission.
+2. **Build block directory**: Iterates through the collected pointers, detecting discontinuities (where `row_ptrs[i] != row_ptrs[i-1] + row_width`). Each contiguous run produces one `DictBlockEntry`. The directory is then **sorted by `base_ptr`** to enable binary search — this is critical because the `TupleDataChunkIterator` returns pointers in logical (chunk/part) order, not address order.
 
 3. **Create dictionary arrays**: For each RHS output column, creates a `VectorChildBuffer` via `DictionaryVector::CreateReusableDictionary(type, build_count)`, then gathers the column data from row-format into the columnar vector using `TupleDataCollection::Gather`.
 
@@ -62,12 +65,12 @@ Three-step process:
 **Modified: `ScanStructure::NextInnerJoin`** — two emission sites:
 
 - **Fast path** (lines ~1140–1163, when `!ht.chains_longer_than_one`): When `use_dict_emission` is true, instead of calling `GatherResult` for each output column, we:
-  1. Build a `SelectionVector` by looking up `ht.ptr_to_dict_idx.at(ptrs[idx])` for each matched row
+  1. Build a `SelectionVector` by calling `ht.PtrToDictIdx(ptrs[idx])` for each matched row
   2. Call `vector.Dictionary(ht.dict_arrays[i], build_sel_vec)` for each output column
 
 - **Slow/compaction path** (lines ~1183–1205, when chains are longer than one): Same logic but uses `rhs_pointers` (the compaction buffer) instead of direct `pointers` vector.
 
-**Modified: `JoinHashTable::ScanFullOuter`** (lines ~1607–1627): When `use_dict_emission && found_entries > 0`, converts addresses to dictionary indices via `ptr_to_dict_idx` and emits dictionary vectors instead of calling `data_collection->Gather`.
+**Modified: `JoinHashTable::ScanFullOuter`** (lines ~1607–1627): When `use_dict_emission && found_entries > 0`, converts addresses to dictionary indices via `PtrToDictIdx` and emits dictionary vectors instead of calling `data_collection->Gather`.
 
 ### 3. `src/execution/operator/join/physical_hash_join.cpp`
 
@@ -128,7 +131,7 @@ Merge local hash tables → Unpartition → Check perfect hash join
     → [NEW] If not perfect and count <= 1M:
         BuildDictionaryArrays:
           1. Scan all row pointers from TupleDataCollection
-          2. Build unordered_map (pointer → dictionary index)
+          2. Build block directory (detect contiguous runs, sort by address)
           3. Gather each output column into columnar VectorChildBuffer
           4. Set use_dict_emission = true
     → ScheduleFinalize (build pointer table as before)
@@ -141,7 +144,7 @@ For each probe chunk:
         For each matched row:
             LHS: Slice probe_data as before
             RHS: [NEW] If use_dict_emission:
-                     Convert row pointers → dictionary indices via ptr_to_dict_idx
+                     Convert row pointers → dictionary indices via PtrToDictIdx
                      Emit Dictionary vectors referencing dict_arrays
                  Else:
                      GatherResult from row-format (original path)
@@ -161,11 +164,23 @@ Dictionary vectors propagate through the pipeline. Key beneficiaries:
 During probe, matched rows are identified by `data_ptr_t` pointers into the `TupleDataCollection`. We need to convert these to dictionary indices (0-based positions in the pre-materialized dictionary arrays).
 
 ### Approach
-`unordered_map<data_ptr_t, idx_t> ptr_to_dict_idx` — stores one entry per build-side row. Built during `BuildDictionaryArrays` by iterating all row pointers and assigning sequential indices. During probe, each matched row pointer is looked up in the map to obtain its dictionary index via `ptr_to_dict_idx.at(ptr)`.
+**Block directory with pointer arithmetic.** The `TupleDataCollection` stores rows contiguously within each `TupleDataChunkPart` at stride `row_width` (confirmed at `tuple_data_allocator.cpp:410–412`). During `BuildDictionaryArrays`, we detect contiguous runs by checking `row_ptrs[i] != row_ptrs[i-1] + row_width` and record one `DictBlockEntry` per discontinuity. The directory is then **sorted by `base_ptr`** to enable binary search.
 
-- **Build cost**: O(N) hash insertions during finalization
-- **Lookup cost**: O(1) amortized hash table lookup per matched probe row
-- **Memory**: ~64 bytes per build-side row (hash table overhead)
+Lookup via `PtrToDictIdx`:
+```
+upper_bound(block_directory, ptr)  →  decrement  →  start_idx + (ptr - base_ptr) / row_width
+```
+
+For a typical 1M-row build side with 256KB blocks and 32-byte rows, there are ~4 blocks. Binary search over 4 entries is 2 comparisons — effectively O(1) with zero pointer chasing and perfect cache locality.
+
+**Critical detail:** The block directory must be sorted by `base_ptr` after construction because the `TupleDataChunkIterator` returns row pointers in logical (chunk/part) order, not ascending address order. Rows from different hash partitions are allocated from different memory blocks, so their addresses can be in any order.
+
+| Metric | Value |
+|--------|-------|
+| Memory overhead | ~0 bytes amortized (typically 1–10 entries × 16 bytes total) |
+| Build cost | O(N) linear scan + O(B log B) sort where B = number of blocks |
+| Lookup cost | O(log B) binary search + 1 integer division |
+| Cache behavior | Excellent — entire directory fits in one cache line |
 
 ---
 
@@ -185,7 +200,6 @@ During probe, matched rows are identified by `data_ptr_t` pointers into the `Tup
 
 ## Cleanup Notes
 
-- `src/execution/join_hashtable.cpp` line 14 contains a stray `#include <iostream>` that should be removed. It was likely added during debugging and is not used.
 - `benchmark/query.benchmark` was added to the `benchmark/` directory during profiling setup — it is not part of the optimization implementation.
 - `benchmark/tpch_bench.cpp` is an empty staged file unrelated to this optimization.
 - Minor whitespace changes in `benchmark/CMakeLists.txt` and `benchmark/tpch/CMakeLists.txt` (trailing newline removal) — cosmetic only.
