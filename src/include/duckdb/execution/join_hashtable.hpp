@@ -20,6 +20,8 @@
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/planner/filter/bloom_filter.hpp"
 
+#include <unordered_map>
+
 namespace duckdb {
 
 class BufferManager;
@@ -27,6 +29,7 @@ class BufferHandle;
 class ColumnDataCollection;
 struct ColumnDataAppendState;
 struct ClientConfig;
+class PhysicalHashJoin;
 struct ResidualPredicateInfo;
 
 struct JoinHTScanState {
@@ -221,6 +224,9 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
+	//! Build dictionary arrays for small build side dictionary emission
+	void BuildDictionaryArrays(const PhysicalHashJoin &op);
+
 	idx_t Count() const {
 		return data_collection->Count();
 	}
@@ -312,6 +318,18 @@ public:
 	unique_ptr<ResidualPredicateInfo> residual_info;
 	//! Mapping from lhs_output_columns positions to lhs_probe_data positions
 	vector<idx_t> lhs_output_in_probe;
+
+	//===--------------------------------------------------------------------===//
+	// Small Build Side Dictionary Emission
+	//===--------------------------------------------------------------------===//
+	//! Whether dictionary emission is active for this hash table
+	bool use_dict_emission = false;
+	//! Dictionary arrays — one VectorChildBuffer per output column, with UUID assigned
+	//! Indexed in the same order as output_columns
+	vector<buffer_ptr<VectorChildBuffer>> dict_arrays;
+
+	//! Map from row pointer to dictionary index for O(1) lookup during probe
+	unordered_map<data_ptr_t, idx_t> ptr_to_dict_idx;
 
 	struct {
 		mutex mj_lock;
@@ -434,6 +452,8 @@ public:
 	static constexpr double DEFAULT_LOAD_FACTOR = 2.0;
 	//! For a LOAD_FACTOR of 1.5, the HT is between 33% and 67% full
 	static constexpr double EXTERNAL_LOAD_FACTOR = 1.5;
+	//! Maximum build-side row count to enable dictionary emission
+	static constexpr idx_t DICT_EMISSION_MAX_ROWS = 1048576;
 	//! Minimum capacity of the pointer table
 	static constexpr idx_t MINIMUM_CAPACITY = 16384;
 

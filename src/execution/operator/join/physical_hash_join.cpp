@@ -1139,6 +1139,12 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
 		sink.perfect_join_executor.reset();
+
+		// Check if we can use dictionary emission for a small build side
+		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS) {
+			ht.BuildDictionaryArrays(*this);
+		}
+
 		sink.ScheduleFinalize(pipeline, event);
 	}
 	sink.finalized = true;
