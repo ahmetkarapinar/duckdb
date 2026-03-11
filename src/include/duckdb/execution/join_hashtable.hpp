@@ -223,7 +223,7 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
-	//! Build dictionary arrays for small build side dictionary emission
+	//! Pre-materialize build-side columns into dictionary arrays for small build sides
 	void BuildDictionaryArrays(const PhysicalHashJoin &op);
 
 	idx_t Count() const {
@@ -323,15 +323,9 @@ public:
 	//===--------------------------------------------------------------------===//
 	//! Whether dictionary emission is active for this hash table
 	bool use_dict_emission = false;
-	//! Dictionary arrays — one VectorChildBuffer per output column, with UUID assigned
-	//! Indexed in the same order as output_columns
+	//! Pre-materialized columnar data for each RHS output column, indexed as output_columns
 	vector<buffer_ptr<VectorChildBuffer>> dict_arrays;
-
-	//! Offset within each serialized row where the embedded dict index is stored.
-	//! Valid only when use_dict_emission is true. The uint32_t dict index is written
-	//! at this offset (the start of the build payload area) after BuildDictionaryArrays
-	//! gathers all output columns into dict_arrays — at that point the build payload
-	//! bytes are dead data and safe to overwrite.
+	//! Row offset where the embedded uint32_t dictionary index is stored (first build column)
 	idx_t dict_idx_row_offset = 0;
 
 	struct {

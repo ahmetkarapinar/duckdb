@@ -1137,7 +1137,7 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 					result.SetCardinality(result_count);
 
 					if (ht.use_dict_emission) {
-						// Build selection vector of dictionary indices from embedded row data
+						// emit RHS columns as dictionary vectors using embedded indices
 						SelectionVector build_sel_vec(result_count);
 						auto ptrs = FlatVector::GetData<data_ptr_t>(pointers);
 						for (idx_t i = 0; i < result_count; i++) {
@@ -1180,7 +1180,7 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		result.SetCardinality(base_count);
 
 		if (ht.use_dict_emission) {
-			// Convert buffered rhs_pointers to dictionary indices from embedded row data
+			// emit RHS columns as dictionary vectors using embedded indices
 			SelectionVector build_sel_vec(base_count);
 			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
 			for (idx_t i = 0; i < base_count; i++) {
@@ -1666,14 +1666,14 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 		return;
 	}
 
-	// Dictionary vectors do not support STRUCT types — bail out if any output column is STRUCT
+	// STRUCT columns are not supported by dictionary vectors
 	for (const auto &type : op.rhs_output_columns.col_types) {
 		if (type.InternalType() == PhysicalType::STRUCT) {
 			return;
 		}
 	}
 
-	// Step 1: Scan all row locations from the TupleDataCollection
+	// collect all row locations
 	Vector row_locations(LogicalType::POINTER, build_count);
 	auto row_ptrs = FlatVector::GetData<data_ptr_t>(row_locations);
 
@@ -1690,13 +1690,13 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	} while (iterator.Next());
 	D_ASSERT(total == build_count);
 
-	// Step 2: Create dictionary arrays — one per output column
+	// gather each output column into a reusable dictionary buffer
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t i = 0; i < op.rhs_output_columns.col_types.size(); i++) {
 		const auto &type = op.rhs_output_columns.col_types[i];
 		auto dict_buf = DictionaryVector::CreateReusableDictionary(type, build_count);
 
-		// Gather column data from row-format into the columnar dictionary vector
+		// gather from row-format into the columnar vector
 		auto &vec = dict_buf->data;
 		const auto output_col_idx = output_columns[i];
 		D_ASSERT(vec.GetType() == layout_ptr->GetTypes()[output_col_idx]);
@@ -1705,22 +1705,8 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 		dict_arrays.emplace_back(std::move(dict_buf));
 	}
 
-	// Step 3: Embed the dictionary index into each row's build payload area.
-	//
-	// Safety: After Step 2 has gathered all output columns into columnar dict_arrays,
-	// the build payload bytes in the serialized rows are dead data — no code path reads
-	// them when use_dict_emission is true. This is guaranteed by the activation conditions
-	// in PhysicalHashJoin::Finalize:
-	//   - join_type != SINGLE  → NextSingleJoin (which GatherResults from rows) is unreachable
-	//   - !residual_predicate  → ApplyResidualPredicate (which gathers build payload columns
-	//                            for residual filter evaluation) is unreachable
-	//   - The three guarded probe sites (NextInnerJoin fast/slow, ScanFullOuter) use
-	//     dict_arrays instead of GatherResult when use_dict_emission is true
-	//   - ScheduleFinalize only reads/writes the hash/NEXT pointer at pointer_offset
-	//   - PerformKeyComparison and RowMatcher only read condition columns
-	//
-	// We write a uint32_t at the offset of the first build column. The payload area
-	// size is (tuple_size - offset), which was checked >= sizeof(uint32_t) at activation.
+	// embed dictionary index into the build payload area of each row
+	// (the payload bytes are no longer read when use_dict_emission is true)
 	const auto &offsets = layout_ptr->GetOffsets();
 	dict_idx_row_offset = offsets[condition_types.size()];
 	D_ASSERT(tuple_size - dict_idx_row_offset >= sizeof(uint32_t));

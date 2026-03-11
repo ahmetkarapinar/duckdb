@@ -1140,12 +1140,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	if (!use_perfect_hash) {
 		sink.perfect_join_executor.reset();
 
-		// Check if we can use dictionary emission for a small build side.
-		// Approach A embeds the dict index into the build payload area of each serialized row,
-		// so we must exclude cases where that area is read after BuildDictionaryArrays:
-		//   - SINGLE joins: NextSingleJoin reads build payload via GatherResult
-		//   - Residual predicates: ApplyResidualPredicate gathers build payload columns
-		//   - Tiny payload: need >= sizeof(uint32_t) bytes in the build payload area
+		// try dictionary emission for small, non-external build sides without residual predicates
 		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
 		    ht.join_type != JoinType::SINGLE && !ht.residual_predicate) {
 			const auto &offsets = ht.layout_ptr->GetOffsets();
