@@ -20,7 +20,6 @@
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/planner/filter/bloom_filter.hpp"
 
-#include <unordered_map>
 
 namespace duckdb {
 
@@ -328,8 +327,12 @@ public:
 	//! Indexed in the same order as output_columns
 	vector<buffer_ptr<VectorChildBuffer>> dict_arrays;
 
-	//! Map from row pointer to dictionary index for O(1) lookup during probe
-	unordered_map<data_ptr_t, idx_t> ptr_to_dict_idx;
+	//! Offset within each serialized row where the embedded dict index is stored.
+	//! Valid only when use_dict_emission is true. The uint32_t dict index is written
+	//! at this offset (the start of the build payload area) after BuildDictionaryArrays
+	//! gathers all output columns into dict_arrays — at that point the build payload
+	//! bytes are dead data and safe to overwrite.
+	idx_t dict_idx_row_offset = 0;
 
 	struct {
 		mutex mj_lock;

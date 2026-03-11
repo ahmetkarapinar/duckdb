@@ -11,7 +11,6 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include <iostream>
 namespace duckdb {
 
 using ValidityBytes = JoinHashTable::ValidityBytes;
@@ -1138,12 +1137,12 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 					result.SetCardinality(result_count);
 
 					if (ht.use_dict_emission) {
-						// Build selection vector of dictionary indices via hash map lookup
+						// Build selection vector of dictionary indices from embedded row data
 						SelectionVector build_sel_vec(result_count);
 						auto ptrs = FlatVector::GetData<data_ptr_t>(pointers);
 						for (idx_t i = 0; i < result_count; i++) {
 							auto idx = chain_match_sel_vector.get_index(i);
-							build_sel_vec.set_index(i, ht.ptr_to_dict_idx.at(ptrs[idx]));
+							build_sel_vec.set_index(i, Load<uint32_t>(ptrs[idx] + ht.dict_idx_row_offset));
 						}
 						for (idx_t i = 0; i < ht.output_columns.size(); i++) {
 							auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
@@ -1181,11 +1180,11 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		result.SetCardinality(base_count);
 
 		if (ht.use_dict_emission) {
-			// Convert buffered rhs_pointers to dictionary indices via hash map lookup
+			// Convert buffered rhs_pointers to dictionary indices from embedded row data
 			SelectionVector build_sel_vec(base_count);
 			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
 			for (idx_t i = 0; i < base_count; i++) {
-				build_sel_vec.set_index(i, ht.ptr_to_dict_idx.at(rhs_ptrs[i]));
+				build_sel_vec.set_index(i, Load<uint32_t>(rhs_ptrs[i] + ht.dict_idx_row_offset));
 			}
 			for (idx_t i = 0; i < ht.output_columns.size(); i++) {
 				auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
@@ -1608,7 +1607,7 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 		SelectionVector build_sel_vec(found_entries);
 		auto key_locs = FlatVector::GetData<data_ptr_t>(addresses);
 		for (idx_t j = 0; j < found_entries; j++) {
-			build_sel_vec.set_index(j, ptr_to_dict_idx.at(key_locs[j]));
+			build_sel_vec.set_index(j, Load<uint32_t>(key_locs[j] + dict_idx_row_offset));
 		}
 		for (idx_t i = 0; i < output_columns.size(); i++) {
 			auto &vector = result.data[left_column_count + i];
@@ -1691,14 +1690,7 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	} while (iterator.Next());
 	D_ASSERT(total == build_count);
 
-	// Step 2: Build pointer-to-index map for O(1) lookup during probe
-	ptr_to_dict_idx.clear();
-	ptr_to_dict_idx.reserve(build_count);
-	for (idx_t i = 0; i < build_count; i++) {
-		ptr_to_dict_idx[row_ptrs[i]] = i;
-	}
-
-	// Step 3: Create dictionary arrays — one per output column
+	// Step 2: Create dictionary arrays — one per output column
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t i = 0; i < op.rhs_output_columns.col_types.size(); i++) {
 		const auto &type = op.rhs_output_columns.col_types[i];
@@ -1711,6 +1703,29 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 		dc.Gather(row_locations, sel, build_count, output_col_idx, vec, sel, nullptr);
 
 		dict_arrays.emplace_back(std::move(dict_buf));
+	}
+
+	// Step 3: Embed the dictionary index into each row's build payload area.
+	//
+	// Safety: After Step 2 has gathered all output columns into columnar dict_arrays,
+	// the build payload bytes in the serialized rows are dead data — no code path reads
+	// them when use_dict_emission is true. This is guaranteed by the activation conditions
+	// in PhysicalHashJoin::Finalize:
+	//   - join_type != SINGLE  → NextSingleJoin (which GatherResults from rows) is unreachable
+	//   - !residual_predicate  → ApplyResidualPredicate (which gathers build payload columns
+	//                            for residual filter evaluation) is unreachable
+	//   - The three guarded probe sites (NextInnerJoin fast/slow, ScanFullOuter) use
+	//     dict_arrays instead of GatherResult when use_dict_emission is true
+	//   - ScheduleFinalize only reads/writes the hash/NEXT pointer at pointer_offset
+	//   - PerformKeyComparison and RowMatcher only read condition columns
+	//
+	// We write a uint32_t at the offset of the first build column. The payload area
+	// size is (tuple_size - offset), which was checked >= sizeof(uint32_t) at activation.
+	const auto &offsets = layout_ptr->GetOffsets();
+	dict_idx_row_offset = offsets[condition_types.size()];
+	D_ASSERT(tuple_size - dict_idx_row_offset >= sizeof(uint32_t));
+	for (idx_t i = 0; i < build_count; i++) {
+		Store<uint32_t>(static_cast<uint32_t>(i), row_ptrs[i] + dict_idx_row_offset);
 	}
 
 	use_dict_emission = true;
