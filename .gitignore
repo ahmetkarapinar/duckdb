@@ -358,3 +358,9 @@ extension_external
 
 test/sql/pragma/output.json
 tools/pythonpkg/duckdb_build/
+
+# Local project analysis and report files
+/approach_a_safety_analysis.md
+/embed_dict_index_analysis.md
+/embedded_dict_idx_report.md
+/benchmark/query.benchmark
