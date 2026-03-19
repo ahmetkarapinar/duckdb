@@ -226,6 +226,11 @@ public:
 	//! Pre-materialize build-side columns into dictionary arrays for small build sides
 	void BuildDictionaryArrays(const PhysicalHashJoin &op);
 
+	//! Emit build-side columns as dictionary vectors using embedded indices
+	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
+	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
+	                     idx_t rhs_col_offset) const;
+
 	idx_t Count() const {
 		return data_collection->Count();
 	}
