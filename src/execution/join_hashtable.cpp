@@ -11,7 +11,6 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-
 namespace duckdb {
 
 using ValidityBytes = JoinHashTable::ValidityBytes;
@@ -1137,12 +1136,27 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 					}
 					result.SetCardinality(result_count);
 
-					// on the RHS, we need to fetch the data from the hash table
-					for (idx_t i = 0; i < ht.output_columns.size(); i++) {
-						auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
-						const auto output_col_idx = ht.output_columns[i];
-						D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
-						GatherResult(vector, chain_match_sel_vector, result_count, output_col_idx);
+					if (ht.use_dict_emission) {
+						// emit RHS columns as dictionary vectors using embedded indices
+						SelectionVector build_sel_vec(result_count);
+						auto ptrs = FlatVector::GetData<data_ptr_t>(pointers);
+						for (idx_t i = 0; i < result_count; i++) {
+							auto idx = chain_match_sel_vector.get_index(i);
+							build_sel_vec.set_index(i, Load<uint32_t>(ptrs[idx] + ht.dict_idx_row_offset));
+						}
+						for (idx_t i = 0; i < ht.output_columns.size(); i++) {
+							auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
+							D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[ht.output_columns[i]]);
+							vector.Dictionary(ht.dict_arrays[i], build_sel_vec);
+						}
+					} else {
+						// on the RHS, we need to fetch the data from the hash table
+						for (idx_t i = 0; i < ht.output_columns.size(); i++) {
+							auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
+							const auto output_col_idx = ht.output_columns[i];
+							D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
+							GatherResult(vector, chain_match_sel_vector, result_count, output_col_idx);
+						}
 					}
 
 					AdvancePointers();
@@ -1165,12 +1179,26 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		}
 		result.SetCardinality(base_count);
 
-		// 2) gather RHS vectors
-		for (idx_t i = 0; i < ht.output_columns.size(); i++) {
-			auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
-			const auto output_col_idx = ht.output_columns[i];
-			D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
-			GatherResult(vector, base_count, output_col_idx);
+		if (ht.use_dict_emission) {
+			// emit RHS columns as dictionary vectors using embedded indices
+			SelectionVector build_sel_vec(base_count);
+			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
+			for (idx_t i = 0; i < base_count; i++) {
+				build_sel_vec.set_index(i, Load<uint32_t>(rhs_ptrs[i] + ht.dict_idx_row_offset));
+			}
+			for (idx_t i = 0; i < ht.output_columns.size(); i++) {
+				auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
+				D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[ht.output_columns[i]]);
+				vector.Dictionary(ht.dict_arrays[i], build_sel_vec);
+			}
+		} else {
+			// 2) gather RHS vectors
+			for (idx_t i = 0; i < ht.output_columns.size(); i++) {
+				auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
+				const auto output_col_idx = ht.output_columns[i];
+				D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
+				GatherResult(vector, base_count, output_col_idx);
+			}
 		}
 	}
 }
@@ -1575,11 +1603,24 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 	}
 
 	// gather the values from the RHS
-	for (idx_t i = 0; i < output_columns.size(); i++) {
-		auto &vector = result.data[left_column_count + i];
-		const auto output_col_idx = output_columns[i];
-		D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
-		data_collection->Gather(addresses, sel_vector, found_entries, output_col_idx, vector, sel_vector, nullptr);
+	if (use_dict_emission && found_entries > 0) {
+		SelectionVector build_sel_vec(found_entries);
+		auto key_locs = FlatVector::GetData<data_ptr_t>(addresses);
+		for (idx_t j = 0; j < found_entries; j++) {
+			build_sel_vec.set_index(j, Load<uint32_t>(key_locs[j] + dict_idx_row_offset));
+		}
+		for (idx_t i = 0; i < output_columns.size(); i++) {
+			auto &vector = result.data[left_column_count + i];
+			D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_columns[i]]);
+			vector.Dictionary(dict_arrays[i], build_sel_vec);
+		}
+	} else {
+		for (idx_t i = 0; i < output_columns.size(); i++) {
+			auto &vector = result.data[left_column_count + i];
+			const auto output_col_idx = output_columns[i];
+			D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
+			data_collection->Gather(addresses, sel_vector, found_entries, output_col_idx, vector, sel_vector, nullptr);
+		}
 	}
 }
 
@@ -1616,6 +1657,64 @@ idx_t JoinHashTable::ScanKeyColumn(Vector &addresses, Vector &result, idx_t colu
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	data_collection->Gather(addresses, sel, key_count, column_index, result, sel, nullptr);
 	return key_count;
+}
+
+void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
+	auto &dc = *data_collection;
+	const auto build_count = dc.Count();
+	if (build_count == 0) {
+		return;
+	}
+
+	// STRUCT columns are not supported by dictionary vectors
+	for (const auto &type : op.rhs_output_columns.col_types) {
+		if (type.InternalType() == PhysicalType::STRUCT) {
+			return;
+		}
+	}
+
+	// collect all row locations
+	Vector row_locations(LogicalType::POINTER, build_count);
+	auto row_ptrs = FlatVector::GetData<data_ptr_t>(row_locations);
+
+	JoinHTScanState scan_state(dc, 0, dc.ChunkCount(), TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
+	idx_t total = 0;
+	auto &iterator = scan_state.iterator;
+	const auto loc = iterator.GetRowLocations();
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		for (idx_t i = 0; i < count; i++) {
+			row_ptrs[total + i] = loc[i];
+		}
+		total += count;
+	} while (iterator.Next());
+	D_ASSERT(total == build_count);
+
+	// gather each output column into a reusable dictionary buffer
+	const auto &sel = *FlatVector::IncrementalSelectionVector();
+	for (idx_t i = 0; i < op.rhs_output_columns.col_types.size(); i++) {
+		const auto &type = op.rhs_output_columns.col_types[i];
+		auto dict_buf = DictionaryVector::CreateReusableDictionary(type, build_count);
+
+		// gather from row-format into the columnar vector
+		auto &vec = dict_buf->data;
+		const auto output_col_idx = output_columns[i];
+		D_ASSERT(vec.GetType() == layout_ptr->GetTypes()[output_col_idx]);
+		dc.Gather(row_locations, sel, build_count, output_col_idx, vec, sel, nullptr);
+
+		dict_arrays.emplace_back(std::move(dict_buf));
+	}
+
+	// embed dictionary index into the build payload area of each row
+	// (the payload bytes are no longer read when use_dict_emission is true)
+	const auto &offsets = layout_ptr->GetOffsets();
+	dict_idx_row_offset = offsets[condition_types.size()];
+	D_ASSERT(tuple_size - dict_idx_row_offset >= sizeof(uint32_t));
+	for (idx_t i = 0; i < build_count; i++) {
+		Store<uint32_t>(static_cast<uint32_t>(i), row_ptrs[i] + dict_idx_row_offset);
+	}
+
+	use_dict_emission = true;
 }
 
 idx_t JoinHashTable::GetTotalSize(const vector<idx_t> &partition_sizes, const vector<idx_t> &partition_counts,
