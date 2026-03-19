@@ -188,6 +188,33 @@ ORDER BY p.id, b.v;
 100	1	one-b
 200	2	two
 
+# --- Test 11: Large probe side (above DICT_EMISSION_MIN_PROBE_ROWS threshold) ---
+statement ok
+CREATE TABLE large_probe_build (k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO large_probe_build VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+
+statement ok
+CREATE TABLE large_probe AS
+SELECT (i % 3) + 1 AS k, i AS id FROM range(300000) t(i);
+
+query II
+SELECT b.v, COUNT(*)
+FROM large_probe p JOIN large_probe_build b ON p.k = b.k
+GROUP BY b.v
+ORDER BY b.v;
+----
+alpha	100000
+beta	100000
+gamma	100000
+
+statement ok
+DROP TABLE large_probe_build;
+
+statement ok
+DROP TABLE large_probe;
+
 statement ok
 DROP TABLE customers;
 

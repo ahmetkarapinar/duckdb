@@ -451,6 +451,8 @@ public:
 	static constexpr double EXTERNAL_LOAD_FACTOR = 1.5;
 	//! Maximum build-side row count to enable dictionary emission
 	static constexpr idx_t DICT_EMISSION_MAX_ROWS = 1048576;
+	//! Minimum probe-side estimated cardinality to enable dictionary emission
+	static constexpr idx_t DICT_EMISSION_MIN_PROBE_ROWS = 262144;
 	//! Minimum capacity of the pointer table
 	static constexpr idx_t MINIMUM_CAPACITY = 16384;
 

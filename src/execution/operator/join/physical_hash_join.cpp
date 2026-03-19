@@ -1140,8 +1140,12 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	if (!use_perfect_hash) {
 		sink.perfect_join_executor.reset();
 
-		// try dictionary emission for small, non-external build sides without residual predicates
+		// try dictionary emission for small, non-external build sides with a large enough probe side
+		// the probe-side cardinality gate avoids the overhead of building dictionary vectors when
+		// there are too few probe rows to amortize the cost
+		const auto probe_cardinality = children[0].get().estimated_cardinality;
 		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
+		    probe_cardinality >= JoinHashTable::DICT_EMISSION_MIN_PROBE_ROWS &&
 		    ht.join_type != JoinType::SINGLE && !ht.residual_predicate) {
 			const auto &offsets = ht.layout_ptr->GetOffsets();
 			const auto build_payload_size = ht.tuple_size - offsets[ht.condition_types.size()];
