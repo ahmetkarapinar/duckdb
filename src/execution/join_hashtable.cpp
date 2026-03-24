@@ -2007,6 +2007,9 @@ void ProbeSpill::PrepareNextProbe() {
 //===--------------------------------------------------------------------===//
 data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
 	if (use_dict_emission) {
+		if (!chains_longer_than_one) {
+			return nullptr;
+		}
 		auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
 		return aux_next_ptrs[dict_idx];
 	}
