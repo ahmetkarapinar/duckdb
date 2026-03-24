@@ -752,6 +752,12 @@ public:
 			sink.hash_table->MergePrefixRangeBuildState(*prefix_range_state);
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
+
+		// Embed dictionary indices into NEXT_PTR after chains are built
+		if (sink.hash_table->dict_arrays_prepared) {
+			sink.hash_table->EmbedDictionaryIndices();
+		}
+
 		sink.hash_table->finalized = true;
 	}
 
@@ -1274,6 +1280,14 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
+		// Try dictionary emission for small, non-external build sides with a large enough probe side
+		const auto probe_cardinality = children[0].get().estimated_cardinality;
+		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
+		    probe_cardinality >= JoinHashTable::DICT_EMISSION_MIN_PROBE_ROWS &&
+		    ht.join_type != JoinType::SINGLE && !rhs_output_columns.col_types.empty()) {
+			ht.PrepareDictionaryArrays(*this);
+		}
+
 		sink.ScheduleFinalize(pipeline, event);
 	}
 	sink.finalized = true;
