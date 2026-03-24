@@ -30,6 +30,7 @@ class ColumnDataCollection;
 struct ColumnDataAppendState;
 struct ClientConfig;
 struct ResidualPredicateInfo;
+class PhysicalHashJoin;
 
 struct JoinHTScanState {
 public:
@@ -226,6 +227,20 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
+	//! Phase A: Scan TDC and gather build-side columns into reusable dictionary arrays.
+	//! Called before ScheduleFinalize. Does NOT modify any row data.
+	void PrepareDictionaryArrays(const PhysicalHashJoin &op);
+	//! Phase B: Save original NEXT_PTR values (if chaining), embed dictionary indices
+	//! into NEXT_PTR field. Called after ScheduleFinalize completes.
+	void EmbedDictionaryIndices();
+	//! Emit build-side columns as dictionary vectors using embedded indices (direct overload)
+	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
+	//! Emit build-side columns as dictionary vectors using embedded indices (selection overload)
+	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
+	                     idx_t rhs_col_offset) const;
+	//! Follow chain pointer, respecting dict emission (uses aux_next_ptrs when active)
+	data_ptr_t GetNextPointer(data_ptr_t row_ptr) const;
+
 	idx_t Count() const {
 		return data_collection->Count();
 	}
@@ -317,6 +332,24 @@ public:
 	unique_ptr<ResidualPredicateInfo> residual_info;
 	//! Mapping from lhs_output_columns positions to lhs_probe_data positions
 	vector<idx_t> lhs_output_in_probe;
+
+	// Small Build Side Dictionary Emission
+	//! Whether dictionary emission is active for this hash table
+	bool use_dict_emission = false;
+	//! Whether dictionary arrays have been prepared (Phase A complete, waiting for finalize to embed)
+	bool dict_arrays_prepared = false;
+	//! Pre-materialized columnar data for each RHS output column, indexed as output_columns
+	vector<buffer_ptr<VectorChildBuffer>> dict_arrays;
+	//! Auxiliary array storing original NEXT_PTR values for rows when chains exist.
+	//! Indexed by dictionary index. Only populated when chains_longer_than_one is true.
+	vector<data_ptr_t> aux_next_ptrs;
+	//! Row pointers collected during Phase A, consumed by Phase B
+	vector<data_ptr_t> prepared_row_ptrs;
+
+	//! Maximum build-side row count to enable dictionary emission
+	static constexpr idx_t DICT_EMISSION_MAX_ROWS = 1048576;
+	//! Minimum probe-side estimated cardinality to enable dictionary emission
+	static constexpr idx_t DICT_EMISSION_MIN_PROBE_ROWS = 262144;
 
 	struct {
 		mutex mj_lock;

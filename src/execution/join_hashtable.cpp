@@ -1082,7 +1082,7 @@ void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_
 	auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(this->pointers);
 	for (idx_t i = 0; i < sel_count; i++) {
 		auto idx = sel.get_index(i);
-		ptrs[idx] = LoadPointer(ptrs[idx] + ht.pointer_offset);
+		ptrs[idx] = ht.GetNextPointer(ptrs[idx]);
 		if (ptrs[idx]) {
 			this->sel_vector.set_index(new_count++, idx);
 		}
@@ -1169,11 +1169,17 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 					result.SetCardinality(result_count);
 
 					// on the RHS, we need to fetch the data from the hash table
-					for (idx_t i = 0; i < ht.output_columns.size(); i++) {
-						auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
-						const auto output_col_idx = ht.output_columns[i];
-						D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
-						GatherResult(vector, chain_match_sel_vector, result_count, output_col_idx);
+					if (ht.use_dict_emission) {
+						auto ptrs = FlatVector::GetData<data_ptr_t>(pointers);
+						ht.EmitDictVectors(ptrs, chain_match_sel_vector, result_count, result,
+						                   ht.lhs_output_in_probe.size());
+					} else {
+						for (idx_t i = 0; i < ht.output_columns.size(); i++) {
+							auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
+							const auto output_col_idx = ht.output_columns[i];
+							D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
+							GatherResult(vector, chain_match_sel_vector, result_count, output_col_idx);
+						}
 					}
 
 					AdvancePointers();
@@ -1197,11 +1203,16 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		result.SetCardinality(base_count);
 
 		// 2) gather RHS vectors
-		for (idx_t i = 0; i < ht.output_columns.size(); i++) {
-			auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
-			const auto output_col_idx = ht.output_columns[i];
-			D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
-			GatherResult(vector, base_count, output_col_idx);
+		if (ht.use_dict_emission) {
+			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
+			ht.EmitDictVectors(rhs_ptrs, base_count, result, ht.lhs_output_in_probe.size());
+		} else {
+			for (idx_t i = 0; i < ht.output_columns.size(); i++) {
+				auto &vector = result.data[ht.lhs_output_in_probe.size() + i];
+				const auto output_col_idx = ht.output_columns[i];
+				D_ASSERT(vector.GetType() == ht.layout_ptr->GetTypes()[output_col_idx]);
+				GatherResult(vector, base_count, output_col_idx);
+			}
 		}
 	}
 }
@@ -1296,7 +1307,7 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_da
 					// threads Technically it is, but it does not matter, since the only value that can be written is
 					// "true"
 					Store<bool>(true, ptr + ht.tuple_size);
-					auto next_ptr = LoadPointer(ptr + ht.pointer_offset);
+					auto next_ptr = ht.GetNextPointer(ptr);
 					if (!next_ptr) {
 						break;
 					}
@@ -1649,11 +1660,16 @@ void JoinHashTable::ScanFullOuter(JoinHTScanState &state, Vector &addresses, Dat
 	}
 
 	// gather the values from the RHS
-	for (idx_t i = 0; i < output_columns.size(); i++) {
-		auto &vector = result.data[left_column_count + i];
-		const auto output_col_idx = output_columns[i];
-		D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
-		data_collection->Gather(addresses, sel_vector, found_entries, output_col_idx, vector, sel_vector, nullptr);
+	if (use_dict_emission && found_entries > 0) {
+		auto key_locs = FlatVector::GetData<data_ptr_t>(addresses);
+		EmitDictVectors(key_locs, found_entries, result, left_column_count);
+	} else {
+		for (idx_t i = 0; i < output_columns.size(); i++) {
+			auto &vector = result.data[left_column_count + i];
+			const auto output_col_idx = output_columns[i];
+			D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
+			data_collection->Gather(addresses, sel_vector, found_entries, output_col_idx, vector, sel_vector, nullptr);
+		}
 	}
 }
 
@@ -1984,6 +2000,114 @@ void ProbeSpill::PrepareNextProbe() {
 	}
 	consumer = make_uniq<ColumnDataConsumer>(*global_spill_collection, column_ids);
 	consumer->InitializeScan();
+}
+
+//===--------------------------------------------------------------------===//
+// Small Build Side Dictionary Emission
+//===--------------------------------------------------------------------===//
+data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
+	if (use_dict_emission) {
+		auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
+		return aux_next_ptrs[dict_idx];
+	}
+	return LoadPointer(row_ptr + pointer_offset);
+}
+
+void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result,
+                                    idx_t rhs_col_offset) const {
+	SelectionVector build_sel_vec(count);
+	for (idx_t i = 0; i < count; i++) {
+		build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[i] + pointer_offset));
+	}
+	for (idx_t i = 0; i < output_columns.size(); i++) {
+		auto &vector = result.data[rhs_col_offset + i];
+		vector.Dictionary(dict_arrays[i], build_sel_vec);
+	}
+}
+
+void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count,
+                                    DataChunk &result, idx_t rhs_col_offset) const {
+	SelectionVector build_sel_vec(count);
+	for (idx_t i = 0; i < count; i++) {
+		auto idx = ptr_sel.get_index(i);
+		build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[idx] + pointer_offset));
+	}
+	for (idx_t i = 0; i < output_columns.size(); i++) {
+		auto &vector = result.data[rhs_col_offset + i];
+		vector.Dictionary(dict_arrays[i], build_sel_vec);
+	}
+}
+
+void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
+	auto &dc = *data_collection;
+	const auto build_count = dc.Count();
+	if (build_count == 0) {
+		return;
+	}
+
+	// STRUCT bailout: Vector::Dictionary() does not support STRUCT types
+	for (auto &type : op.rhs_output_columns.col_types) {
+		if (type.InternalType() == PhysicalType::STRUCT) {
+			return;
+		}
+	}
+
+	// Step 1: Collect all row pointers from the TupleDataCollection
+	prepared_row_ptrs.resize(build_count);
+	JoinHTScanState scan_state(dc, 0, dc.ChunkCount(), TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
+	idx_t total = 0;
+	auto &iterator = scan_state.iterator;
+	const auto loc = iterator.GetRowLocations();
+	do {
+		const auto count = iterator.GetCurrentChunkCount();
+		for (idx_t i = 0; i < count; i++) {
+			prepared_row_ptrs[total + i] = loc[i];
+		}
+		total += count;
+	} while (iterator.Next());
+	D_ASSERT(total == build_count);
+
+	// Step 2: Gather each output column into a reusable dictionary buffer
+	Vector row_locations(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()));
+	SelectionVector sel(build_count);
+	for (idx_t i = 0; i < build_count; i++) {
+		sel.set_index(i, i);
+	}
+
+	for (idx_t i = 0; i < op.rhs_output_columns.col_types.size(); i++) {
+		const auto &type = op.rhs_output_columns.col_types[i];
+		auto dict_buf = DictionaryVector::CreateReusableDictionary(type, build_count);
+		auto &vec = dict_buf->data;
+		const auto output_col_idx = output_columns[i];
+		dc.Gather(row_locations, sel, build_count, output_col_idx, vec, sel, nullptr);
+		dict_arrays.emplace_back(std::move(dict_buf));
+	}
+
+	dict_arrays_prepared = true;
+}
+
+void JoinHashTable::EmbedDictionaryIndices() {
+	const auto build_count = prepared_row_ptrs.size();
+	D_ASSERT(build_count > 0);
+
+	// If chains exist, save original NEXT_PTR values before overwriting
+	if (chains_longer_than_one) {
+		aux_next_ptrs.resize(build_count);
+		for (idx_t i = 0; i < build_count; i++) {
+			aux_next_ptrs[i] = LoadPointer(prepared_row_ptrs[i] + pointer_offset);
+		}
+	}
+
+	// Embed dictionary index into NEXT_PTR field of each row
+	for (idx_t i = 0; i < build_count; i++) {
+		Store<uint32_t>(static_cast<uint32_t>(i), prepared_row_ptrs[i] + pointer_offset);
+	}
+
+	use_dict_emission = true;
+
+	// Free prepared row pointers — no longer needed
+	prepared_row_ptrs.clear();
+	prepared_row_ptrs.shrink_to_fit();
 }
 
 } // namespace duckdb
