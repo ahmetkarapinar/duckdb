@@ -1197,7 +1197,7 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		}
 		result.SetCardinality(base_count);
 
-		// 2) gather RHS vectors
+		// gather RHS vectors
 		if (ht.use_dict_emission) {
 			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
 			ht.EmitDictVectors(rhs_ptrs, base_count, result, ht.lhs_output_in_probe.size());
@@ -1994,14 +1994,14 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 		return;
 	}
 
-	// STRUCT bailout: Vector::Dictionary() does not support STRUCT types
+	// Vector::Dictionary() does not support STRUCT types
 	for (auto &type : op.rhs_output_columns.col_types) {
 		if (type.InternalType() == PhysicalType::STRUCT) {
 			return;
 		}
 	}
 
-	// Step 1: Collect all row pointers from the TupleDataCollection
+	// collect all row pointers from the TupleDataCollection
 	prepared_row_ptrs.resize(build_count);
 	JoinHTScanState scan_state(dc, 0, dc.ChunkCount(), TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
 	idx_t total = 0;
@@ -2016,7 +2016,7 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 	} while (iterator.Next());
 	D_ASSERT(total == build_count);
 
-	// Step 2: Gather each output column into a reusable dictionary buffer
+	// gather each output column into a reusable dictionary buffer
 	Vector row_locations(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()));
 	SelectionVector sel(build_count);
 	for (idx_t i = 0; i < build_count; i++) {
@@ -2031,7 +2031,6 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 		dc.Gather(row_locations, sel, build_count, output_col_idx, vec, sel, nullptr);
 		dict_arrays.emplace_back(std::move(dict_buf));
 	}
-
 	dict_arrays_prepared = true;
 }
 
@@ -2039,7 +2038,7 @@ void JoinHashTable::EmbedDictionaryIndices() {
 	const auto build_count = prepared_row_ptrs.size();
 	D_ASSERT(build_count > 0);
 
-	// If chains exist, save original NEXT_PTR values before overwriting
+	// if chains exist, save original NEXT_PTR values before overwriting
 	if (chains_longer_than_one) {
 		aux_next_ptrs.resize(build_count);
 		for (idx_t i = 0; i < build_count; i++) {
@@ -2047,14 +2046,14 @@ void JoinHashTable::EmbedDictionaryIndices() {
 		}
 	}
 
-	// Embed dictionary index into NEXT_PTR field of each row
+	// embed dictionary index into NEXT_PTR field
 	for (idx_t i = 0; i < build_count; i++) {
 		Store<uint32_t>(static_cast<uint32_t>(i), prepared_row_ptrs[i] + pointer_offset);
 	}
 
 	use_dict_emission = true;
 
-	// Free prepared row pointers — no longer needed
+	// free prepared row pointers
 	prepared_row_ptrs.clear();
 	prepared_row_ptrs.shrink_to_fit();
 }
