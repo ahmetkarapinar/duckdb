@@ -227,18 +227,16 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
-	//! Phase A: Scan TDC and gather build-side columns into reusable dictionary arrays.
-	//! Called before ScheduleFinalize. Does NOT modify any row data.
+	//! Pre-materialize build-side columns into reusable dictionary arrays (Phase A, before ScheduleFinalize)
 	void PrepareDictionaryArrays(const PhysicalHashJoin &op);
-	//! Phase B: Save original NEXT_PTR values (if chaining), embed dictionary indices
-	//! into NEXT_PTR field. Called after ScheduleFinalize completes.
+	//! Embed dictionary indices into each row's NEXT_PTR field (Phase B, after ScheduleFinalize)
 	void EmbedDictionaryIndices();
-	//! Emit build-side columns as dictionary vectors using embedded indices (direct overload)
+	//! Emit build-side columns as dictionary vectors using embedded indices
 	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
-	//! Emit build-side columns as dictionary vectors using embedded indices (selection overload)
+	//! Emit build-side columns as dictionary vectors using embedded indices (selection vector variant)
 	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
 	                     idx_t rhs_col_offset) const;
-	//! Follow chain pointer, respecting dict emission (uses aux_next_ptrs when active)
+	//! Get the next chain pointer, resolving through aux_next_ptrs when dict emission is active
 	data_ptr_t GetNextPointer(data_ptr_t row_ptr) const;
 
 	idx_t Count() const {
@@ -333,22 +331,21 @@ public:
 	//! Mapping from lhs_output_columns positions to lhs_probe_data positions
 	vector<idx_t> lhs_output_in_probe;
 
-	// Small Build Side Dictionary Emission
-	//! Whether dictionary emission is active for this hash table
+	// Dictionary emission for small build sides
+	//! Whether dictionary emission is active
 	bool use_dict_emission = false;
-	//! Whether dictionary arrays have been prepared (Phase A complete, waiting for finalize to embed)
+	//! Whether dictionary arrays have been prepared (Phase A complete)
 	bool dict_arrays_prepared = false;
-	//! Pre-materialized columnar data for each RHS output column, indexed as output_columns
-	vector<buffer_ptr<VectorChildBuffer>> dict_arrays;
-	//! Auxiliary array storing original NEXT_PTR values for rows when chains exist.
-	//! Indexed by dictionary index. Only populated when chains_longer_than_one is true.
+	//! Pre-materialized columnar data for each RHS output column
+	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
+	//! Saved NEXT_PTR values indexed by dict index, only populated when chains_longer_than_one
 	vector<data_ptr_t> aux_next_ptrs;
 	//! Row pointers collected during Phase A, consumed by Phase B
 	vector<data_ptr_t> prepared_row_ptrs;
 
-	//! Maximum build-side row count to enable dictionary emission
+	//! Maximum build-side row count for dictionary emission
 	static constexpr idx_t DICT_EMISSION_MAX_ROWS = 1048576;
-	//! Minimum probe-side estimated cardinality to enable dictionary emission
+	//! Minimum probe-side estimated cardinality for dictionary emission
 	static constexpr idx_t DICT_EMISSION_MIN_PROBE_ROWS = 262144;
 
 	struct {

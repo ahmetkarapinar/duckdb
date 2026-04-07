@@ -755,7 +755,7 @@ public:
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
-		// Embed dictionary indices into NEXT_PTR after chains are built
+		// embed dictionary indices into NEXT_PTR after chains are built
 		if (sink.hash_table->dict_arrays_prepared) {
 			sink.hash_table->EmbedDictionaryIndices();
 		}
@@ -1303,7 +1303,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
-		// Try dictionary emission for small, non-external build sides with a large enough probe side
+		// try dictionary emission for small build sides with a large probe side
 		const auto probe_cardinality = children[0].get().estimated_cardinality;
 		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
 		    probe_cardinality >= JoinHashTable::DICT_EMISSION_MIN_PROBE_ROWS &&
