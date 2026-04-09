@@ -2006,14 +2006,15 @@ void ProbeSpill::PrepareNextProbe() {
 // Small Build Side Dictionary Emission
 //===--------------------------------------------------------------------===//
 data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
-	if (use_dict_emission) {
-		if (!chains_longer_than_one) {
-			return nullptr;
-		}
-		auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
-		return aux_next_ptrs[dict_idx];
+	if (!use_dict_emission) {
+		return LoadPointer(row_ptr + pointer_offset);
 	}
-	return LoadPointer(row_ptr + pointer_offset);
+	if (!chains_longer_than_one) {
+		// no chains exist, so aux_next_ptrs is empty - the answer is always nullptr
+		return nullptr;
+	}
+	const auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
+	return aux_next_ptrs[dict_idx];
 }
 
 void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result,
@@ -2022,9 +2023,9 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk
 	for (idx_t i = 0; i < count; i++) {
 		build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[i] + pointer_offset));
 	}
-	for (idx_t i = 0; i < output_columns.size(); i++) {
-		auto &vector = result.data[rhs_col_offset + i];
-		vector.Dictionary(dict_arrays[i], build_sel_vec);
+	for (idx_t col_idx = 0; col_idx < output_columns.size(); col_idx++) {
+		auto &vector = result.data[rhs_col_offset + col_idx];
+		vector.Dictionary(dict_arrays[col_idx], build_sel_vec);
 	}
 }
 
@@ -2032,18 +2033,18 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector 
                                     DataChunk &result, idx_t rhs_col_offset) const {
 	SelectionVector build_sel_vec(count);
 	for (idx_t i = 0; i < count; i++) {
-		auto idx = ptr_sel.get_index(i);
+		const auto idx = ptr_sel.get_index(i);
 		build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[idx] + pointer_offset));
 	}
-	for (idx_t i = 0; i < output_columns.size(); i++) {
-		auto &vector = result.data[rhs_col_offset + i];
-		vector.Dictionary(dict_arrays[i], build_sel_vec);
+	for (idx_t col_idx = 0; col_idx < output_columns.size(); col_idx++) {
+		auto &vector = result.data[rhs_col_offset + col_idx];
+		vector.Dictionary(dict_arrays[col_idx], build_sel_vec);
 	}
 }
 
 void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
-	auto &dc = *data_collection;
-	const auto build_count = dc.Count();
+	auto &collection = *data_collection;
+	const auto build_count = collection.Count();
 	if (build_count == 0) {
 		return;
 	}
@@ -2055,44 +2056,42 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 		}
 	}
 
-	// collect all row pointers from the TupleDataCollection
+	// Pin every chunk so that the row pointers we collect remain valid until EmbedDictionaryIndices
+	// runs in FinishEvent (after the parallel finalize tasks have completed)
 	prepared_row_ptrs.resize(build_count);
-	JoinHTScanState scan_state(dc, 0, dc.ChunkCount(), TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
-	idx_t total = 0;
+	JoinHTScanState scan_state(collection, 0, collection.ChunkCount(),
+	                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
+	idx_t collected = 0;
 	auto &iterator = scan_state.iterator;
-	const auto loc = iterator.GetRowLocations();
+	const auto chunk_row_locations = iterator.GetRowLocations();
 	do {
-		const auto count = iterator.GetCurrentChunkCount();
-		for (idx_t i = 0; i < count; i++) {
-			prepared_row_ptrs[total + i] = loc[i];
+		const auto chunk_count = iterator.GetCurrentChunkCount();
+		for (idx_t i = 0; i < chunk_count; i++) {
+			prepared_row_ptrs[collected + i] = chunk_row_locations[i];
 		}
-		total += count;
+		collected += chunk_count;
 	} while (iterator.Next());
-	D_ASSERT(total == build_count);
+	D_ASSERT(collected == build_count);
 
-	// gather each output column into a reusable dictionary buffer
-	Vector row_locations(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()));
-	SelectionVector sel(build_count);
-	for (idx_t i = 0; i < build_count; i++) {
-		sel.set_index(i, i);
-	}
-
-	for (idx_t i = 0; i < op.rhs_output_columns.col_types.size(); i++) {
-		const auto &type = op.rhs_output_columns.col_types[i];
-		auto dict_buf = DictionaryVector::CreateReusableDictionary(type, build_count);
-		auto &vec = dict_buf->data;
-		const auto output_col_idx = output_columns[i];
-		dc.Gather(row_locations, sel, build_count, output_col_idx, vec, sel, nullptr);
-		dict_arrays.emplace_back(std::move(dict_buf));
+	Vector row_pointer_vector(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()));
+	const auto &sel = *FlatVector::IncrementalSelectionVector();
+	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
+		const auto &type = op.rhs_output_columns.col_types[col_idx];
+		auto dict_entry = DictionaryVector::CreateReusableDictionary(type, build_count);
+		const auto output_col_idx = output_columns[col_idx];
+		collection.Gather(row_pointer_vector, sel, build_count, output_col_idx, dict_entry->data, sel, nullptr);
+		dict_arrays.emplace_back(std::move(dict_entry));
 	}
 	dict_arrays_prepared = true;
 }
 
 void JoinHashTable::EmbedDictionaryIndices() {
+	D_ASSERT(dict_arrays_prepared);
 	const auto build_count = prepared_row_ptrs.size();
 	D_ASSERT(build_count > 0);
 
-	// if chains exist, save original NEXT_PTR values before overwriting
+	// If chains exist, save the original NEXT_PTR values before overwriting them. GetNextPointer
+	// reads these back when chain-following code paths walk the chains during probing.
 	if (chains_longer_than_one) {
 		aux_next_ptrs.resize(build_count);
 		for (idx_t i = 0; i < build_count; i++) {
@@ -2100,16 +2099,12 @@ void JoinHashTable::EmbedDictionaryIndices() {
 		}
 	}
 
-	// embed dictionary index into NEXT_PTR field
 	for (idx_t i = 0; i < build_count; i++) {
 		Store<uint32_t>(static_cast<uint32_t>(i), prepared_row_ptrs[i] + pointer_offset);
 	}
 
 	use_dict_emission = true;
-
-	// free prepared row pointers
 	prepared_row_ptrs.clear();
-	prepared_row_ptrs.shrink_to_fit();
 }
 
 } // namespace duckdb

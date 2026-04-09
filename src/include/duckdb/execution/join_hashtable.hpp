@@ -227,16 +227,18 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
-	//! Pre-materialize build-side columns into reusable dictionary arrays (Phase A, before ScheduleFinalize)
+	//! Pre-materializes the build-side output columns into reusable dictionary arrays. Runs before
+	//! ScheduleFinalize so it can read row data without racing the chain-pointer construction.
 	void PrepareDictionaryArrays(const PhysicalHashJoin &op);
-	//! Embed dictionary indices into each row's NEXT_PTR field (Phase B, after ScheduleFinalize)
+	//! Embeds the dictionary index into each row's NEXT_PTR field. Runs after all finalize tasks
+	//! complete, so the original chain pointers are first saved into aux_next_ptrs when needed.
 	void EmbedDictionaryIndices();
-	//! Emit build-side columns as dictionary vectors using embedded indices
+	//! Emits the build-side columns as dictionary vectors using embedded indices in row_ptrs[0..count)
 	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
-	//! Emit build-side columns as dictionary vectors using embedded indices (selection vector variant)
+	//! Emits the build-side columns as dictionary vectors using embedded indices in row_ptrs[ptr_sel[0..count)]
 	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
 	                     idx_t rhs_col_offset) const;
-	//! Get the next chain pointer, resolving through aux_next_ptrs when dict emission is active
+	//! Returns the next chain pointer for row_ptr, resolving through aux_next_ptrs when dict emission is active
 	data_ptr_t GetNextPointer(data_ptr_t row_ptr) const;
 
 	idx_t Count() const {
@@ -331,7 +333,6 @@ public:
 	//! Mapping from lhs_output_columns positions to lhs_probe_data positions
 	vector<idx_t> lhs_output_in_probe;
 
-	// Dictionary emission for small build sides
 	//! Whether dictionary emission is active
 	bool use_dict_emission = false;
 	//! Whether dictionary arrays have been prepared (Phase A complete)

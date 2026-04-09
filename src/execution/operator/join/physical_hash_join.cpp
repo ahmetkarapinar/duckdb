@@ -755,7 +755,8 @@ public:
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
-		// embed dictionary indices into NEXT_PTR after chains are built
+		// Phase B of dictionary emission: now that all NEXT_PTR chains have been written by the
+		// finalize tasks, we can save them and embed the dictionary indices in their place
 		if (sink.hash_table->dict_arrays_prepared) {
 			sink.hash_table->EmbedDictionaryIndices();
 		}
@@ -1303,7 +1304,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
-		// try dictionary emission for small build sides with a large probe side
+		// Phase A of dictionary emission: pre-materialize the build-side output columns into
+		// reusable dictionary arrays, but only when the build side is small relative to the probe
+		// side. SINGLE joins are excluded because NextSingleJoin does not call EmitDictVectors.
 		const auto probe_cardinality = children[0].get().estimated_cardinality;
 		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
 		    probe_cardinality >= JoinHashTable::DICT_EMISSION_MIN_PROBE_ROWS &&
