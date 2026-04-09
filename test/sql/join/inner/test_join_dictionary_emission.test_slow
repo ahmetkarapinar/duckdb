@@ -1,0 +1,511 @@
+# name: test/sql/join/inner/test_join_dictionary_emission.test_slow
+# description: Test the small build-side dictionary emission path in PhysicalHashJoin (NEXT_PTR embedding)
+# group: [inner]
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+PRAGMA verify_parallelism
+
+# shared probe table: 262200 rows, just above DICT_EMISSION_MIN_PROBE_ROWS (262144)
+statement ok
+CREATE TABLE big_probe AS
+SELECT i AS id,
+       ('K' || (((i % 10) + 1)::VARCHAR)) AS k,
+       ((i % 10) + 1) AS bucket,
+       ((i % 7))     AS extra
+FROM range(262200) t(i);
+
+query I
+SELECT COUNT(*) FROM big_probe;
+----
+262200
+
+query I
+SELECT COUNT(DISTINCT k) FROM big_probe;
+----
+10
+
+# inner join with VARCHAR key, single VARCHAR build payload
+statement ok
+CREATE TABLE small_build_a (k VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO small_build_a VALUES
+    ('K1',  'one'),
+    ('K2',  'two'),
+    ('K3',  'three'),
+    ('K4',  'four'),
+    ('K5',  'five'),
+    ('K6',  'six'),
+    ('K7',  'seven'),
+    ('K8',  'eight'),
+    ('K9',  'nine'),
+    ('K10', 'ten');
+
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_a b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# downstream GROUP BY on the build VARCHAR column (the primary beneficial workload)
+query II
+SELECT b.name, MAX(p.id) AS max_id
+FROM big_probe p JOIN small_build_a b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	262197
+five	262194
+four	262193
+nine	262198
+one	262190
+seven	262196
+six	262195
+ten	262199
+three	262192
+two	262191
+
+# left outer join with unmatched probe rows
+statement ok
+CREATE TABLE big_probe_with_misses AS
+SELECT id, k FROM big_probe
+UNION ALL
+SELECT 1000000 + i, 'KX' FROM range(5) t(i);
+
+query II
+SELECT COALESCE(b.name, 'NO_MATCH') AS name, COUNT(*) AS cnt
+FROM big_probe_with_misses p LEFT JOIN small_build_a b ON p.k = b.k
+GROUP BY COALESCE(b.name, 'NO_MATCH')
+ORDER BY name;
+----
+NO_MATCH	5
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# right outer join with unmatched build rows
+statement ok
+CREATE TABLE small_build_b (k VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO small_build_b VALUES
+    ('K1',  'one'),
+    ('K2',  'two'),
+    ('K3',  'three'),
+    ('K4',  'four'),
+    ('K5',  'five'),
+    ('K6',  'six'),
+    ('K7',  'seven'),
+    ('K8',  'eight'),
+    ('K9',  'nine'),
+    ('K10', 'ten'),
+    ('KZ',  'orphan');
+
+query II
+SELECT b.name, COUNT(p.id) AS cnt
+FROM big_probe p RIGHT JOIN small_build_b b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+orphan	0
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# full outer join with unmatched rows on both sides
+query II
+SELECT COALESCE(b.name, 'NO_MATCH') AS name, COUNT(*) AS cnt
+FROM big_probe_with_misses p FULL OUTER JOIN small_build_b b ON p.k = b.k
+GROUP BY COALESCE(b.name, 'NO_MATCH')
+ORDER BY name;
+----
+NO_MATCH	5
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+orphan	1
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# semi join flipped to RIGHT_SEMI by build_probe_side_optimizer (small build on the left)
+query II
+SELECT b.k, b.name
+FROM small_build_b b SEMI JOIN big_probe p ON b.k = p.k
+ORDER BY b.k;
+----
+K1	one
+K10	ten
+K2	two
+K3	three
+K4	four
+K5	five
+K6	six
+K7	seven
+K8	eight
+K9	nine
+
+# anti join flipped to RIGHT_ANTI: only the orphan build row should remain
+query II
+SELECT b.k, b.name
+FROM small_build_b b ANTI JOIN big_probe p ON b.k = p.k
+ORDER BY b.k;
+----
+KZ	orphan
+
+# long duplicate-key chain on the build side: stresses aux_next_ptrs and GetNextPointer
+statement ok
+CREATE TABLE small_build_chain (k VARCHAR, v INTEGER);
+
+statement ok
+INSERT INTO small_build_chain SELECT 'K1', i FROM range(500) t(i);
+
+statement ok
+INSERT INTO small_build_chain VALUES
+    ('K2',  2), ('K3',  3), ('K4',  4), ('K5',  5),
+    ('K6',  6), ('K7',  7), ('K8',  8), ('K9',  9), ('K10', 10);
+
+query I
+SELECT COUNT(*)
+FROM big_probe p JOIN small_build_chain b ON p.k = b.k;
+----
+13345980
+
+query II
+SELECT p.k, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_chain b ON p.k = b.k
+GROUP BY p.k
+ORDER BY p.k;
+----
+K1	13110000
+K10	26220
+K2	26220
+K3	26220
+K4	26220
+K5	26220
+K6	26220
+K7	26220
+K8	26220
+K9	26220
+
+# multiple build payload physical types: VARCHAR, INTEGER, DECIMAL, DATE
+statement ok
+CREATE TABLE small_build_types (
+    k VARCHAR,
+    name VARCHAR,
+    qty INTEGER,
+    price DECIMAL(10, 2),
+    launch DATE
+);
+
+statement ok
+INSERT INTO small_build_types VALUES
+    ('K1',  'one',     10, 1.50,  DATE '2020-01-01'),
+    ('K2',  'two',     20, 2.50,  DATE '2020-02-02'),
+    ('K3',  'three',   30, 3.50,  DATE '2020-03-03'),
+    ('K4',  'four',    40, 4.50,  DATE '2020-04-04'),
+    ('K5',  'five',    50, 5.50,  DATE '2020-05-05'),
+    ('K6',  'six',     60, 6.50,  DATE '2020-06-06'),
+    ('K7',  'seven',   70, 7.50,  DATE '2020-07-07'),
+    ('K8',  'eight',   80, 8.50,  DATE '2020-08-08'),
+    ('K9',  'nine',    90, 9.50,  DATE '2020-09-09'),
+    ('K10', 'ten',    100, 10.50, DATE '2020-10-10');
+
+query IIIII
+SELECT b.name, b.qty, b.price, b.launch, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_types b ON p.k = b.k
+GROUP BY b.name, b.qty, b.price, b.launch
+ORDER BY b.name;
+----
+eight	80	8.50	2020-08-08	26220
+five	50	5.50	2020-05-05	26220
+four	40	4.50	2020-04-04	26220
+nine	90	9.50	2020-09-09	26220
+one	10	1.50	2020-01-01	26220
+seven	70	7.50	2020-07-07	26220
+six	60	6.50	2020-06-06	26220
+ten	100	10.50	2020-10-10	26220
+three	30	3.50	2020-03-03	26220
+two	20	2.50	2020-02-02	26220
+
+# NULL keys on the build side: NULL keys must not match anything in the probe
+statement ok
+CREATE TABLE small_build_null_keys (k VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO small_build_null_keys VALUES
+    ('K1',  'one'),
+    ('K2',  'two'),
+    ('K3',  'three'),
+    ('K4',  'four'),
+    ('K5',  'five'),
+    ('K6',  'six'),
+    ('K7',  'seven'),
+    ('K8',  'eight'),
+    ('K9',  'nine'),
+    ('K10', 'ten'),
+    (NULL,  'null-row-1'),
+    (NULL,  'null-row-2');
+
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_null_keys b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# NULL values in the build payload: NULLs propagate through the dictionary
+statement ok
+CREATE TABLE small_build_null_payload (k VARCHAR, name VARCHAR, score INTEGER);
+
+statement ok
+INSERT INTO small_build_null_payload VALUES
+    ('K1',  'one',   NULL),
+    ('K2',  NULL,    200),
+    ('K3',  'three', 300),
+    ('K4',  NULL,    NULL),
+    ('K5',  'five',  500),
+    ('K6',  'six',   600),
+    ('K7',  'seven', 700),
+    ('K8',  'eight', 800),
+    ('K9',  'nine',  900),
+    ('K10', 'ten',   1000);
+
+query IIII
+SELECT b.k, b.name, b.score, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_null_payload b ON p.k = b.k
+GROUP BY b.k, b.name, b.score
+ORDER BY b.k;
+----
+K1	one	NULL	26220
+K10	ten	1000	26220
+K2	NULL	200	26220
+K3	three	300	26220
+K4	NULL	NULL	26220
+K5	five	500	26220
+K6	six	600	26220
+K7	seven	700	26220
+K8	eight	800	26220
+K9	nine	900	26220
+
+# composite (multi-column) join key
+statement ok
+CREATE TABLE small_build_composite (k VARCHAR, b INTEGER, payload VARCHAR);
+
+statement ok
+INSERT INTO small_build_composite VALUES
+    ('K1',  0, 'p0'),
+    ('K2',  1, 'p1'),
+    ('K3',  2, 'p2'),
+    ('K4',  3, 'p3'),
+    ('K5',  4, 'p4'),
+    ('K6',  5, 'p5'),
+    ('K7',  6, 'p6'),
+    ('K8',  0, 'p7'),
+    ('K9',  1, 'p8'),
+    ('K10', 2, 'p9');
+
+query II
+SELECT b.payload, COUNT(*) AS cnt
+FROM big_probe p
+JOIN small_build_composite b ON p.k = b.k AND p.extra = b.b
+GROUP BY b.payload
+ORDER BY b.payload;
+----
+p0	3746
+p1	3746
+p2	3746
+p3	3746
+p4	3746
+p5	3746
+p6	3746
+p7	3746
+p8	3746
+p9	3746
+
+# empty build side: ht.Count() == 0 disables dict emission
+statement ok
+CREATE TABLE empty_build (k VARCHAR, v VARCHAR);
+
+query II
+SELECT b.v, COUNT(*) AS cnt
+FROM big_probe p JOIN empty_build b ON p.k = b.k
+GROUP BY b.v;
+----
+
+# single-row build side
+statement ok
+CREATE TABLE small_build_one (k VARCHAR, v VARCHAR);
+
+statement ok
+INSERT INTO small_build_one VALUES ('K5', 'only-five');
+
+query II
+SELECT b.v, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_one b ON p.k = b.k
+GROUP BY b.v;
+----
+only-five	26220
+
+# Perfect Hash Join wins: integer key with a small build range bypasses dict emission
+statement ok
+CREATE TABLE small_build_int (bucket INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO small_build_int VALUES
+    (1, 'one'),  (2, 'two'),  (3, 'three'),  (4, 'four'),  (5, 'five'),
+    (6, 'six'),  (7, 'seven'), (8, 'eight'), (9, 'nine'), (10, 'ten');
+
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_int b ON p.bucket = b.bucket
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# probe side below DICT_EMISSION_MIN_PROBE_ROWS: falls back to GatherResult
+statement ok
+CREATE TABLE fallback_probe AS
+SELECT i AS id, ('K' || (((i % 10) + 1)::VARCHAR)) AS k
+FROM range(100) t(i);
+
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM fallback_probe p JOIN small_build_a b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	10
+five	10
+four	10
+nine	10
+one	10
+seven	10
+six	10
+ten	10
+three	10
+two	10
+
+# no RHS output columns: dict emission is skipped via the !rhs_output_columns.empty() guard
+query I
+SELECT COUNT(*)
+FROM big_probe p JOIN small_build_a b ON p.k = b.k;
+----
+262200
+
+# STRUCT bailout: a STRUCT-typed RHS output column disables dict emission inside PrepareDictionaryArrays
+statement ok
+CREATE TABLE small_build_struct (k VARCHAR, payload STRUCT(x INTEGER, y VARCHAR));
+
+statement ok
+INSERT INTO small_build_struct VALUES
+    ('K1',  {'x':  1, 'y': 'one'}),
+    ('K2',  {'x':  2, 'y': 'two'}),
+    ('K3',  {'x':  3, 'y': 'three'}),
+    ('K4',  {'x':  4, 'y': 'four'}),
+    ('K5',  {'x':  5, 'y': 'five'}),
+    ('K6',  {'x':  6, 'y': 'six'}),
+    ('K7',  {'x':  7, 'y': 'seven'}),
+    ('K8',  {'x':  8, 'y': 'eight'}),
+    ('K9',  {'x':  9, 'y': 'nine'}),
+    ('K10', {'x': 10, 'y': 'ten'});
+
+query II
+SELECT b.payload, COUNT(*) AS cnt
+FROM big_probe p JOIN small_build_struct b ON p.k = b.k
+GROUP BY b.payload
+ORDER BY (b.payload).x;
+----
+{'x': 1, 'y': one}	26220
+{'x': 2, 'y': two}	26220
+{'x': 3, 'y': three}	26220
+{'x': 4, 'y': four}	26220
+{'x': 5, 'y': five}	26220
+{'x': 6, 'y': six}	26220
+{'x': 7, 'y': seven}	26220
+{'x': 8, 'y': eight}	26220
+{'x': 9, 'y': nine}	26220
+{'x': 10, 'y': ten}	26220
+
+# LEFT_SEMI / LEFT_ANTI on activation-shaped tables: rhs_output_columns is empty
+query I
+SELECT COUNT(*)
+FROM big_probe p SEMI JOIN small_build_a b ON p.k = b.k;
+----
+262200
+
+query I
+SELECT COUNT(*)
+FROM big_probe_with_misses p ANTI JOIN small_build_a b ON p.k = b.k;
+----
+5
+
+# SINGLE join via a correlated scalar subquery: NextSingleJoin does not call EmitDictVectors
+query II
+SELECT b.k, b.name
+FROM small_build_a b
+WHERE b.k = (SELECT MAX(p.k) FROM big_probe p WHERE p.k = b.k)
+ORDER BY b.k;
+----
+K1	one
+K10	ten
+K2	two
+K3	three
+K4	four
+K5	five
+K6	six
+K7	seven
+K8	eight
+K9	nine
