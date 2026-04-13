@@ -492,6 +492,67 @@ FROM big_probe_with_misses p ANTI JOIN small_build_a b ON p.k = b.k;
 ----
 5
 
+# probe-to-build ratio below DICT_EMISSION_PROBE_BUILD_RATIO: build is larger than probe,
+# so dictionary compression provides no benefit and falls back to GatherResult
+statement ok
+CREATE TABLE ratio_large_build AS
+SELECT i AS id, ('K' || (((i % 10) + 1)::VARCHAR)) AS k
+FROM range(500000) t(i);
+
+statement ok
+CREATE TABLE ratio_small_probe AS
+SELECT i AS id, ('K' || (((i % 10) + 1)::VARCHAR)) AS k
+FROM range(300000) t(i);
+
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM ratio_small_probe p JOIN small_build_a b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	30000
+five	30000
+four	30000
+nine	30000
+one	30000
+seven	30000
+six	30000
+ten	30000
+three	30000
+two	30000
+
+# probe-to-build ratio above DICT_EMISSION_PROBE_BUILD_RATIO: probe is much larger than build,
+# so dictionary compression is beneficial and dict emission activates
+statement ok
+CREATE TABLE ratio_tiny_build (k VARCHAR, name VARCHAR);
+
+statement ok
+INSERT INTO ratio_tiny_build VALUES
+    ('K1', 'one'), ('K2', 'two'), ('K3', 'three'), ('K4', 'four'), ('K5', 'five'),
+    ('K6', 'six'), ('K7', 'seven'), ('K8', 'eight'), ('K9', 'nine'), ('K10', 'ten');
+
+statement ok
+CREATE TABLE ratio_big_probe AS
+SELECT i AS id, ('K' || (((i % 10) + 1)::VARCHAR)) AS k
+FROM range(300000) t(i);
+
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM ratio_big_probe p JOIN ratio_tiny_build b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	30000
+five	30000
+four	30000
+nine	30000
+one	30000
+seven	30000
+six	30000
+ten	30000
+three	30000
+two	30000
+
 # SINGLE join via a correlated scalar subquery: NextSingleJoin does not call EmitDictVectors
 query II
 SELECT b.k, b.name
