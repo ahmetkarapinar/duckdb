@@ -1308,7 +1308,8 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 		// reusable dictionary arrays, but only when the build side is small relative to the probe
 		// side. SINGLE joins are excluded because NextSingleJoin does not call EmitDictVectors.
 		const auto probe_cardinality = children[0].get().estimated_cardinality;
-		if (!sink.external && ht.Count() > 0 && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
+		if (!sink.external && ht.Count() >= JoinHashTable::DICT_EMISSION_MIN_BUILD_ROWS &&
+		    ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_ROWS &&
 		    probe_cardinality >= JoinHashTable::DICT_EMISSION_MIN_PROBE_ROWS &&
 		    probe_cardinality >= JoinHashTable::DICT_EMISSION_PROBE_BUILD_RATIO * ht.Count() &&
 		    ht.join_type != JoinType::SINGLE && !rhs_output_columns.col_types.empty()) {
