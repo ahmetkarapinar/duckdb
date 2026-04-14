@@ -350,7 +350,7 @@ public:
 	static constexpr idx_t DICT_EMISSION_MIN_PROBE_ROWS = 262144;
 	//! Minimum probe-to-build ratio for dictionary emission: the probe side must be at least this many
 	//! times larger than the build side to justify the Phase A pre-materialization overhead
-	static constexpr idx_t DICT_EMISSION_PROBE_BUILD_RATIO = 20;
+	static constexpr idx_t DICT_EMISSION_PROBE_BUILD_RATIO = 100;
 
 	struct {
 		mutex mj_lock;
