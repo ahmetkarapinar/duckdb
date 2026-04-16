@@ -345,15 +345,12 @@ public:
 	vector<data_ptr_t> prepared_row_ptrs;
 
 	//! Maximum build-side row count for dictionary emission
-	static constexpr idx_t DICT_EMISSION_MAX_ROWS = 100000;
+	static constexpr idx_t DICT_EMISSION_MAX_BUILD_ROWS = 100000;
 	//! Minimum probe-side estimated cardinality for dictionary emission
 	static constexpr idx_t DICT_EMISSION_MIN_PROBE_ROWS = 262144;
-	//! Minimum build-side row count for dictionary emission: very small dictionaries add indirection
-	//! overhead without meaningful savings
-	static constexpr idx_t DICT_EMISSION_MIN_BUILD_ROWS = 5;
 	//! Minimum probe-to-build ratio for dictionary emission: the probe side must be at least this many
 	//! times larger than the build side to justify the Phase A pre-materialization overhead
-	static constexpr idx_t DICT_EMISSION_PROBE_BUILD_RATIO = 350;
+	static constexpr idx_t DICT_EMISSION_PROBE_BUILD_RATIO = 100;
 
 	struct {
 		mutex mj_lock;
