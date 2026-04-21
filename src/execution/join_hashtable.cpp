@@ -1078,13 +1078,24 @@ void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_
 	}
 
 	// now for all the pointers, we move on to the next set of pointers
+	// hoist the dict-emission check so the common path keeps the original inlined LoadPointer
 	idx_t new_count = 0;
 	auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(this->pointers);
-	for (idx_t i = 0; i < sel_count; i++) {
-		auto idx = sel.get_index(i);
-		ptrs[idx] = ht.GetNextPointer(ptrs[idx]);
-		if (ptrs[idx]) {
-			this->sel_vector.set_index(new_count++, idx);
+	if (ht.use_dict_emission) {
+		for (idx_t i = 0; i < sel_count; i++) {
+			auto idx = sel.get_index(i);
+			ptrs[idx] = ht.GetNextPointer(ptrs[idx]);
+			if (ptrs[idx]) {
+				this->sel_vector.set_index(new_count++, idx);
+			}
+		}
+	} else {
+		for (idx_t i = 0; i < sel_count; i++) {
+			auto idx = sel.get_index(i);
+			ptrs[idx] = LoadPointer(ptrs[idx] + ht.pointer_offset);
+			if (ptrs[idx]) {
+				this->sel_vector.set_index(new_count++, idx);
+			}
 		}
 	}
 	this->count = new_count;
@@ -1293,25 +1304,50 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_da
 
 		if (ht.non_equality_predicates.empty() && !ht.residual_predicate) {
 			// we only have equality predicates - the match is found for the entire chain
-			for (idx_t i = 0; i < result_count; i++) {
-				const auto idx = chain_match_sel_vector.get_index(i);
-				auto &ptr = ptrs[idx];
-				if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
-					ptr = ht.dead_end.get();
-					continue;
-				}
-
-				// Fully mark chain as found
-				while (true) {
-					// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
-					// threads Technically it is, but it does not matter, since the only value that can be written is
-					// "true"
-					Store<bool>(true, ptr + ht.tuple_size);
-					auto next_ptr = ht.GetNextPointer(ptr);
-					if (!next_ptr) {
-						break;
+			// hoist the dict-emission check so the common path keeps the original inlined LoadPointer
+			if (ht.use_dict_emission) {
+				for (idx_t i = 0; i < result_count; i++) {
+					const auto idx = chain_match_sel_vector.get_index(i);
+					auto &ptr = ptrs[idx];
+					if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
+						ptr = ht.dead_end.get();
+						continue;
 					}
-					ptr = next_ptr;
+
+					// Fully mark chain as found
+					while (true) {
+						// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
+						// threads Technically it is, but it does not matter, since the only value that can be written
+						// is "true"
+						Store<bool>(true, ptr + ht.tuple_size);
+						auto next_ptr = ht.GetNextPointer(ptr);
+						if (!next_ptr) {
+							break;
+						}
+						ptr = next_ptr;
+					}
+				}
+			} else {
+				for (idx_t i = 0; i < result_count; i++) {
+					const auto idx = chain_match_sel_vector.get_index(i);
+					auto &ptr = ptrs[idx];
+					if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
+						ptr = ht.dead_end.get();
+						continue;
+					}
+
+					// Fully mark chain as found
+					while (true) {
+						// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
+						// threads Technically it is, but it does not matter, since the only value that can be written
+						// is "true"
+						Store<bool>(true, ptr + ht.tuple_size);
+						auto next_ptr = LoadPointer(ptr + ht.pointer_offset);
+						if (!next_ptr) {
+							break;
+						}
+						ptr = next_ptr;
+					}
 				}
 			}
 		} else {
@@ -2015,32 +2051,27 @@ idx_t JoinHashTable::ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_out
 
 bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external,
                                              idx_t probe_cardinality) const {
-	// external joins partition and rebuild, invalidating row pointers and TDC memory
+	// external joins rebuild partitions, invalidating row pointers
 	if (external) {
 		return false;
 	}
-	// SINGLE joins emit NULLs into flat vectors via FlatVector::SetNull, which has no
-	// dictionary-vector equivalent (Vector::validity is protected)
+	// SINGLE joins need FlatVector::SetNull for unmatched rows; dictionary vectors cannot supply it
 	if (join_type == JoinType::SINGLE) {
 		return false;
 	}
-	// nothing to dictionary-encode if no build columns are projected
 	if (op.rhs_output_columns.col_types.empty()) {
 		return false;
 	}
-	// nothing to dictionary-encode if the build side is empty
 	if (Count() == 0) {
 		return false;
 	}
-	// skip when the probe side is too small to amortize Phase A/B setup
 	if (probe_cardinality < DictionaryEmissionActivation::MIN_PROBE_ROWS) {
 		return false;
 	}
-	// skip when per-row savings are unlikely to amortize Phase A/B setup
 	if (probe_cardinality < DictionaryEmissionActivation::PROBE_BUILD_RATIO * Count()) {
 		return false;
 	}
-	// Vector::Dictionary does not support nested types; mirror CanDoPerfectHashJoin's exclusion
+	// Vector::Dictionary does not support nested types
 	for (const auto &type : op.rhs_output_columns.col_types) {
 		switch (type.InternalType()) {
 		case PhysicalType::STRUCT:
@@ -2051,8 +2082,7 @@ bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool ex
 			break;
 		}
 	}
-	// cap Phase A's dictionary allocation to keep the arrays in L3 (expensive check — kept last
-	// so cheaper gates filter out ineligible cases first)
+	// cap Phase A's dictionary allocation to keep the arrays in L3
 	if (ComputeBuildPayloadBytes(op.rhs_output_columns.col_types) >
 	    DictionaryEmissionActivation::MAX_BUILD_PAYLOAD_BYTES) {
 		return false;
@@ -2065,7 +2095,7 @@ data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
 		return LoadPointer(row_ptr + pointer_offset);
 	}
 	if (!chains_longer_than_one) {
-		// aux_next_ptrs is not populated when there are no chains
+		// aux_next_ptrs is empty in this case
 		return nullptr;
 	}
 	const auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
@@ -2074,6 +2104,7 @@ data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
 
 void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result,
                                     idx_t rhs_col_offset) const {
+	D_ASSERT(output_columns.size() == dict_arrays.size());
 	SelectionVector build_sel_vec(count);
 	for (idx_t i = 0; i < count; i++) {
 		build_sel_vec.set_index(i, Load<uint32_t>(row_ptrs[i] + pointer_offset));
@@ -2086,6 +2117,7 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk
 
 void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count,
                                     DataChunk &result, idx_t rhs_col_offset) const {
+	D_ASSERT(output_columns.size() == dict_arrays.size());
 	SelectionVector build_sel_vec(count);
 	for (idx_t i = 0; i < count; i++) {
 		const auto idx = ptr_sel.get_index(i);
@@ -2100,11 +2132,13 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector 
 void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 	auto &collection = *data_collection;
 	const auto build_count = collection.Count();
-	// CanUseDictionaryEmission guarantees a non-empty build side and non-nested RHS output types
+	// preconditions enforced by CanUseDictionaryEmission
 	D_ASSERT(build_count > 0);
+	// dict index is a uint32_t; assert defensively if MAX_BUILD_PAYLOAD_BYTES is ever relaxed
+	D_ASSERT(build_count <= NumericLimits<uint32_t>::Maximum());
 
-	// pin every chunk so the collected row pointers remain valid until EmbedDictionaryIndices runs
-	// in FinishEvent, after the parallel finalize tasks have completed
+	// captured row pointers stay valid through Phase B because the in-memory TDC owns its
+	// BufferHandles for its lifetime; FinishEvent verifies this before calling EmbedDictionaryIndices
 	prepared_row_ptrs.resize(build_count);
 	JoinHTScanState scan_state(collection, 0, collection.ChunkCount(),
 	                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
@@ -2136,9 +2170,10 @@ void JoinHashTable::EmbedDictionaryIndices() {
 	D_ASSERT(dict_arrays_prepared);
 	const auto build_count = prepared_row_ptrs.size();
 	D_ASSERT(build_count > 0);
+	// dict index is a uint32_t; assert defensively if MAX_BUILD_PAYLOAD_BYTES is ever relaxed
+	D_ASSERT(build_count <= NumericLimits<uint32_t>::Maximum());
 
-	// save the original chain pointers before overwriting NEXT_PTR; GetNextPointer reads
-	// these back during probing
+	// save chain pointers before overwriting NEXT_PTR; GetNextPointer reads them back during probing
 	if (chains_longer_than_one) {
 		aux_next_ptrs.resize(build_count);
 		for (idx_t i = 0; i < build_count; i++) {

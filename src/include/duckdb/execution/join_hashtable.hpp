@@ -48,10 +48,9 @@ private:
 	JoinHTScanState(const JoinHTScanState &) = delete;
 };
 
-//! Threshold constants gating small-build-side dictionary emission.
+//! Threshold constants gating small-build-side dictionary emission
 struct DictionaryEmissionActivation {
-	//! Caps Phase A's dictionary allocation (build_count * sum of RHS output column widths).
-	//! 8 MiB keeps the arrays in L3 and implicitly bounds aux_next_ptrs to the same budget.
+	//! Caps Phase A's dict_arrays allocation; 8 MiB keeps them in L3 and bounds aux_next_ptrs
 	static constexpr idx_t MAX_BUILD_PAYLOAD_BYTES = 8ULL * 1024ULL * 1024ULL;
 	//! Below this, Phase A setup is not amortized by probe-side savings
 	static constexpr idx_t MIN_PROBE_ROWS = 262144;
@@ -239,18 +238,16 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
-	//! Phase A of dictionary emission: pre-materialize the RHS output columns into reusable
-	//! dictionary arrays. Must run before ScheduleFinalize writes the NEXT_PTR chains.
+	//! Dictionary emission Phase A: pre-materialize RHS output columns; runs before ScheduleFinalize
 	void PrepareDictionaryArrays(const PhysicalHashJoin &op);
-	//! Phase B of dictionary emission: save existing NEXT_PTR values into aux_next_ptrs (if
-	//! chains exist) and overwrite the NEXT_PTR field with the dictionary index
+	//! Dictionary emission Phase B: save NEXT_PTR into aux_next_ptrs, then overwrite it with the dict index
 	void EmbedDictionaryIndices();
 	//! Emit dictionary vectors for row_ptrs[0..count)
 	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
 	//! Emit dictionary vectors for row_ptrs[ptr_sel[0..count)]
 	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
 	                     idx_t rhs_col_offset) const;
-	//! Follow the chain pointer. When dict emission is active, resolves via aux_next_ptrs.
+	//! Follow the chain pointer; when dict emission is active, resolves via aux_next_ptrs
 	data_ptr_t GetNextPointer(data_ptr_t row_ptr) const;
 
 	idx_t Count() const {
@@ -356,10 +353,9 @@ public:
 	//! Row pointers collected during Phase A, consumed by Phase B
 	vector<data_ptr_t> prepared_row_ptrs;
 
-	//! Sum of InternalType.Size() over the RHS output types times Count() — the exact footprint
-	//! Phase A would allocate. Excludes key columns (not materialized into dictionary arrays).
+	//! Total bytes Phase A would allocate across dict_arrays for the given RHS output types
 	idx_t ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_output_types) const;
-	//! Returns true iff small-build-side dictionary emission should activate.
+	//! Returns true iff small-build-side dictionary emission should activate
 	bool CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external, idx_t probe_cardinality) const;
 
 	struct {
