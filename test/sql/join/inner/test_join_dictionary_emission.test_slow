@@ -9,7 +9,7 @@ statement ok
 PRAGMA verify_parallelism
 
 # ---------------------------------------------------------------------------
-# shared probe table: 262200 rows, just above DICT_EMISSION_MIN_PROBE_ROWS (262144)
+# shared probe table: 262200 rows, just above DictionaryEmissionActivation::MIN_PROBE_ROWS (262144)
 # keys K1..K10, each appearing 26220 times
 # bucket 1..10, extra 0..6
 # ---------------------------------------------------------------------------
@@ -516,7 +516,7 @@ only-five	26220
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# small probe side: below DICT_EMISSION_MIN_PROBE_ROWS (262144),
+# small probe side: below DictionaryEmissionActivation::MIN_PROBE_ROWS (262144),
 # falls back to GatherResult
 # ---------------------------------------------------------------------------
 statement ok
@@ -542,9 +542,9 @@ three	10
 two	10
 
 # ---------------------------------------------------------------------------
-# probe-to-build ratio below DICT_EMISSION_PROBE_BUILD_RATIO (100x):
+# probe-to-build ratio below DictionaryEmissionActivation::PROBE_BUILD_RATIO (100x):
 # 262200 probe / 3000 build = 87.4 < 100 -> falls back to GatherResult
-# (probe >= 262144 and build <= 100000 both pass; only the ratio fails)
+# (probe >= 262144 and payload size under the 8 MiB cap both pass; only the ratio fails)
 # ---------------------------------------------------------------------------
 statement ok
 CREATE TABLE ratio_large_build AS

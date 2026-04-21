@@ -2005,6 +2005,27 @@ void ProbeSpill::PrepareNextProbe() {
 //===--------------------------------------------------------------------===//
 // Small Build Side Dictionary Emission
 //===--------------------------------------------------------------------===//
+idx_t JoinHashTable::ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_output_types) const {
+	idx_t payload_bytes_per_row = 0;
+	for (const auto &type : rhs_output_types) {
+		payload_bytes_per_row += GetTypeIdSize(type.InternalType());
+	}
+	return Count() * payload_bytes_per_row;
+}
+
+bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external,
+                                             idx_t probe_cardinality) const {
+	const DictionaryEmissionActivation activation {
+	    external,
+	    Count(),
+	    ComputeBuildPayloadBytes(op.rhs_output_columns.col_types),
+	    probe_cardinality,
+	    join_type,
+	    !op.rhs_output_columns.col_types.empty(),
+	};
+	return activation.ShouldActivate();
+}
+
 data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
 	if (!use_dict_emission) {
 		return LoadPointer(row_ptr + pointer_offset);

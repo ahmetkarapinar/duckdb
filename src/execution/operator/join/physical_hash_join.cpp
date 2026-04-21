@@ -1305,13 +1305,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
 		// Phase A of dictionary emission: pre-materialize the build-side output columns into
-		// reusable dictionary arrays, but only when the build side is small relative to the probe
-		// side. SINGLE joins are excluded because NextSingleJoin does not call EmitDictVectors.
-		const auto probe_cardinality = children[0].get().estimated_cardinality;
-		if (!sink.external && ht.Count() <= JoinHashTable::DICT_EMISSION_MAX_BUILD_ROWS &&
-		    probe_cardinality >= JoinHashTable::DICT_EMISSION_MIN_PROBE_ROWS &&
-		    probe_cardinality >= JoinHashTable::DICT_EMISSION_PROBE_BUILD_RATIO * ht.Count() &&
-		    ht.join_type != JoinType::SINGLE && !rhs_output_columns.col_types.empty()) {
+		// reusable dictionary arrays when the build side is small relative to the probe side.
+		// SINGLE joins are excluded because NextSingleJoin does not call EmitDictVectors.
+		if (ht.CanUseDictionaryEmission(*this, sink.external, children[0].get().estimated_cardinality)) {
 			ht.PrepareDictionaryArrays(*this);
 		}
 

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/common/enums/join_type.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types/column/column_data_consumer.hpp"
 #include "duckdb/common/types/column/partitioned_column_data.hpp"
@@ -45,6 +46,60 @@ public:
 private:
 	//! Implicit copying is not allowed
 	JoinHTScanState(const JoinHTScanState &) = delete;
+};
+
+//! Grouped activation parameters, inputs, and decision for small-build-side dictionary emission.
+//! Holds the threshold constants alongside the runtime values they are compared against, and
+//! exposes a single ShouldActivate() check used by PhysicalHashJoin::Finalize.
+struct DictionaryEmissionActivation {
+	//! Maximum payload size (bytes) of build-side output columns. Caps Phase A pre-materialization
+	//! cost — Phase A allocates one VectorChildBuffer per RHS output column of size
+	//! build_count * InternalType.Size(), plus a gather pass that writes the same bytes. Keeping
+	//! the total at 8 MiB fits comfortably in L3 on modern CPUs. aux_next_ptrs is naturally
+	//! bounded by this limit — at 8 MiB payload with the narrowest possible per-row payload
+	//! (~8 B) aux_next_ptrs tops out at 8 MiB (still L3-friendly); for typical 30–100 B payloads
+	//! aux_next_ptrs stays under 2 MiB.
+	static constexpr idx_t MAX_BUILD_PAYLOAD_BYTES = 8ULL * 1024ULL * 1024ULL;
+	//! Minimum probe-side estimated cardinality to amortize Phase A setup
+	static constexpr idx_t MIN_PROBE_ROWS = 262144;
+	//! Minimum probe-to-build row ratio: the probe side must be at least this many times
+	//! larger than the build side to justify the Phase A pre-materialization overhead
+	static constexpr idx_t PROBE_BUILD_RATIO = 100;
+
+	//! True if the hash join is running in external (partitioned-to-disk) mode
+	bool external;
+	//! Number of build-side rows currently in the hash table
+	idx_t build_count;
+	//! Phase A allocation footprint in bytes (build_count * sum of RHS output column sizes)
+	idx_t build_payload_bytes;
+	//! Estimated probe-side cardinality from the planner
+	idx_t probe_cardinality;
+	//! Join type of the hash join
+	JoinType join_type;
+	//! True if the RHS projects at least one output column
+	bool rhs_has_output_columns;
+
+	bool ShouldActivate() const {
+		if (external) {
+			return false;
+		}
+		if (join_type == JoinType::SINGLE) {
+			return false;
+		}
+		if (!rhs_has_output_columns) {
+			return false;
+		}
+		if (build_payload_bytes > MAX_BUILD_PAYLOAD_BYTES) {
+			return false;
+		}
+		if (probe_cardinality < MIN_PROBE_ROWS) {
+			return false;
+		}
+		if (probe_cardinality < PROBE_BUILD_RATIO * build_count) {
+			return false;
+		}
+		return true;
+	}
 };
 
 //! JoinHashTable is a linear probing HT that is used for computing joins
@@ -344,13 +399,15 @@ public:
 	//! Row pointers collected during Phase A, consumed by Phase B
 	vector<data_ptr_t> prepared_row_ptrs;
 
-	//! Maximum build-side row count for dictionary emission
-	static constexpr idx_t DICT_EMISSION_MAX_BUILD_ROWS = 100000;
-	//! Minimum probe-side estimated cardinality for dictionary emission
-	static constexpr idx_t DICT_EMISSION_MIN_PROBE_ROWS = 262144;
-	//! Minimum probe-to-build ratio for dictionary emission: the probe side must be at least this many
-	//! times larger than the build side to justify the Phase A pre-materialization overhead
-	static constexpr idx_t DICT_EMISSION_PROBE_BUILD_RATIO = 100;
+	//! Compute the payload footprint (in bytes) that Phase A would allocate for the given RHS
+	//! output column types at the current build_count. Excludes key columns because those are
+	//! not materialized into dictionary arrays.
+	idx_t ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_output_types) const;
+	//! Returns true iff all activation conditions for small-build-side dictionary emission
+	//! hold. Populates a DictionaryEmissionActivation from the hash table's own state plus
+	//! the caller-supplied runtime inputs and delegates to ShouldActivate(). Mirrors the
+	//! PerfectHashJoinExecutor::CanDoPerfectHashJoin shape.
+	bool CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external, idx_t probe_cardinality) const;
 
 	struct {
 		mutex mj_lock;
