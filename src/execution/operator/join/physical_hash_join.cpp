@@ -755,8 +755,8 @@ public:
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
-		// Phase B of dictionary emission: now that all NEXT_PTR chains have been written by the
-		// finalize tasks, we can save them and embed the dictionary indices in their place
+		// Phase B of dictionary emission: NEXT_PTR chains are now written, so we can save them
+		// and overwrite NEXT_PTR with the dictionary index
 		if (sink.hash_table->dict_arrays_prepared) {
 			sink.hash_table->EmbedDictionaryIndices();
 		}
@@ -1304,9 +1304,8 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
-		// Phase A of dictionary emission: pre-materialize the build-side output columns into
-		// reusable dictionary arrays when the build side is small relative to the probe side.
-		// SINGLE joins are excluded because NextSingleJoin does not call EmitDictVectors.
+		// Phase A of dictionary emission: pre-materialize the RHS output columns into dictionary
+		// arrays before ScheduleFinalize writes the NEXT_PTR chains
 		if (ht.CanUseDictionaryEmission(*this, sink.external, children[0].get().estimated_cardinality)) {
 			ht.PrepareDictionaryArrays(*this);
 		}

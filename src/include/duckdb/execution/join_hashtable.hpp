@@ -48,35 +48,22 @@ private:
 	JoinHTScanState(const JoinHTScanState &) = delete;
 };
 
-//! Grouped activation parameters, inputs, and decision for small-build-side dictionary emission.
-//! Holds the threshold constants alongside the runtime values they are compared against, and
-//! exposes a single ShouldActivate() check used by PhysicalHashJoin::Finalize.
+//! Activation inputs, thresholds, and gating decision for small-build-side dictionary emission.
+//! ShouldActivate() returns true iff every gate passes.
 struct DictionaryEmissionActivation {
-	//! Maximum payload size (bytes) of build-side output columns. Caps Phase A pre-materialization
-	//! cost — Phase A allocates one VectorChildBuffer per RHS output column of size
-	//! build_count * InternalType.Size(), plus a gather pass that writes the same bytes. Keeping
-	//! the total at 8 MiB fits comfortably in L3 on modern CPUs. aux_next_ptrs is naturally
-	//! bounded by this limit — at 8 MiB payload with the narrowest possible per-row payload
-	//! (~8 B) aux_next_ptrs tops out at 8 MiB (still L3-friendly); for typical 30–100 B payloads
-	//! aux_next_ptrs stays under 2 MiB.
+	//! Caps Phase A's dictionary allocation (build_count * sum of RHS output column widths).
+	//! 8 MiB keeps the arrays in L3 and implicitly bounds aux_next_ptrs to the same budget.
 	static constexpr idx_t MAX_BUILD_PAYLOAD_BYTES = 8ULL * 1024ULL * 1024ULL;
-	//! Minimum probe-side estimated cardinality to amortize Phase A setup
+	//! Below this, Phase A setup is not amortized by probe-side savings
 	static constexpr idx_t MIN_PROBE_ROWS = 262144;
-	//! Minimum probe-to-build row ratio: the probe side must be at least this many times
-	//! larger than the build side to justify the Phase A pre-materialization overhead
+	//! Below this ratio, per-row savings are unlikely to amortize Phase A/B setup
 	static constexpr idx_t PROBE_BUILD_RATIO = 100;
 
-	//! True if the hash join is running in external (partitioned-to-disk) mode
 	bool external;
-	//! Number of build-side rows currently in the hash table
 	idx_t build_count;
-	//! Phase A allocation footprint in bytes (build_count * sum of RHS output column sizes)
 	idx_t build_payload_bytes;
-	//! Estimated probe-side cardinality from the planner
 	idx_t probe_cardinality;
-	//! Join type of the hash join
 	JoinType join_type;
-	//! True if the RHS projects at least one output column
 	bool rhs_has_output_columns;
 
 	bool ShouldActivate() const {
@@ -282,18 +269,18 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
-	//! Pre-materializes the build-side output columns into reusable dictionary arrays. Runs before
-	//! ScheduleFinalize so it can read row data without racing the chain-pointer construction.
+	//! Phase A of dictionary emission: pre-materialize the RHS output columns into reusable
+	//! dictionary arrays. Must run before ScheduleFinalize writes the NEXT_PTR chains.
 	void PrepareDictionaryArrays(const PhysicalHashJoin &op);
-	//! Embeds the dictionary index into each row's NEXT_PTR field. Runs after all finalize tasks
-	//! complete, so the original chain pointers are first saved into aux_next_ptrs when needed.
+	//! Phase B of dictionary emission: save existing NEXT_PTR values into aux_next_ptrs (if
+	//! chains exist) and overwrite the NEXT_PTR field with the dictionary index
 	void EmbedDictionaryIndices();
-	//! Emits the build-side columns as dictionary vectors using embedded indices in row_ptrs[0..count)
+	//! Emit dictionary vectors for row_ptrs[0..count)
 	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
-	//! Emits the build-side columns as dictionary vectors using embedded indices in row_ptrs[ptr_sel[0..count)]
+	//! Emit dictionary vectors for row_ptrs[ptr_sel[0..count)]
 	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
 	                     idx_t rhs_col_offset) const;
-	//! Returns the next chain pointer for row_ptr, resolving through aux_next_ptrs when dict emission is active
+	//! Follow the chain pointer. When dict emission is active, resolves via aux_next_ptrs.
 	data_ptr_t GetNextPointer(data_ptr_t row_ptr) const;
 
 	idx_t Count() const {
@@ -388,25 +375,22 @@ public:
 	//! Mapping from lhs_output_columns positions to lhs_probe_data positions
 	vector<idx_t> lhs_output_in_probe;
 
-	//! Whether dictionary emission is active
+	//! True once Phase B has embedded dictionary indices into NEXT_PTR
 	bool use_dict_emission = false;
-	//! Whether dictionary arrays have been prepared (Phase A complete)
+	//! True once Phase A has populated dict_arrays and prepared_row_ptrs
 	bool dict_arrays_prepared = false;
-	//! Pre-materialized columnar data for each RHS output column
+	//! Pre-materialized columnar data, one entry per RHS output column
 	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
-	//! Saved NEXT_PTR values indexed by dict index, only populated when chains_longer_than_one
+	//! Saved NEXT_PTR values, indexed by dict index; only populated when chains_longer_than_one
 	vector<data_ptr_t> aux_next_ptrs;
 	//! Row pointers collected during Phase A, consumed by Phase B
 	vector<data_ptr_t> prepared_row_ptrs;
 
-	//! Compute the payload footprint (in bytes) that Phase A would allocate for the given RHS
-	//! output column types at the current build_count. Excludes key columns because those are
-	//! not materialized into dictionary arrays.
+	//! Sum of InternalType.Size() over the RHS output types times Count() — the exact footprint
+	//! Phase A would allocate. Excludes key columns (not materialized into dictionary arrays).
 	idx_t ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_output_types) const;
-	//! Returns true iff all activation conditions for small-build-side dictionary emission
-	//! hold. Populates a DictionaryEmissionActivation from the hash table's own state plus
-	//! the caller-supplied runtime inputs and delegates to ShouldActivate(). Mirrors the
-	//! PerfectHashJoinExecutor::CanDoPerfectHashJoin shape.
+	//! Returns true iff small-build-side dictionary emission should activate. Populates a
+	//! DictionaryEmissionActivation and delegates to ShouldActivate().
 	bool CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external, idx_t probe_cardinality) const;
 
 	struct {

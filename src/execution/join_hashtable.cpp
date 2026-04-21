@@ -2031,7 +2031,7 @@ data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
 		return LoadPointer(row_ptr + pointer_offset);
 	}
 	if (!chains_longer_than_one) {
-		// no chains exist, so aux_next_ptrs is empty - the answer is always nullptr
+		// aux_next_ptrs is not populated when there are no chains
 		return nullptr;
 	}
 	const auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
@@ -2070,15 +2070,15 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 		return;
 	}
 
-	// Vector::Dictionary() does not support STRUCT types
+	// Vector::Dictionary() does not support STRUCT
 	for (auto &type : op.rhs_output_columns.col_types) {
 		if (type.InternalType() == PhysicalType::STRUCT) {
 			return;
 		}
 	}
 
-	// Pin every chunk so that the row pointers we collect remain valid until EmbedDictionaryIndices
-	// runs in FinishEvent (after the parallel finalize tasks have completed)
+	// pin every chunk so the collected row pointers remain valid until EmbedDictionaryIndices runs
+	// in FinishEvent, after the parallel finalize tasks have completed
 	prepared_row_ptrs.resize(build_count);
 	JoinHTScanState scan_state(collection, 0, collection.ChunkCount(),
 	                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
@@ -2111,8 +2111,8 @@ void JoinHashTable::EmbedDictionaryIndices() {
 	const auto build_count = prepared_row_ptrs.size();
 	D_ASSERT(build_count > 0);
 
-	// If chains exist, save the original NEXT_PTR values before overwriting them. GetNextPointer
-	// reads these back when chain-following code paths walk the chains during probing.
+	// save the original chain pointers before overwriting NEXT_PTR; GetNextPointer reads
+	// these back during probing
 	if (chains_longer_than_one) {
 		aux_next_ptrs.resize(build_count);
 		for (idx_t i = 0; i < build_count; i++) {
