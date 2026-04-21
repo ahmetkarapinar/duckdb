@@ -243,9 +243,9 @@ public:
 	//! Dictionary emission Phase B: save NEXT_PTR into aux_next_ptrs, then overwrite it with the dict index
 	void EmbedDictionaryIndices();
 	//! Emit dictionary vectors for row_ptrs[0..count)
-	void EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
+	void EmitDictVectors(const data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
 	//! Emit dictionary vectors for row_ptrs[ptr_sel[0..count)]
-	void EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
+	void EmitDictVectors(const data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
 	                     idx_t rhs_col_offset) const;
 	//! Follow the chain pointer; when dict emission is active, resolves via aux_next_ptrs
 	data_ptr_t GetNextPointer(data_ptr_t row_ptr) const;

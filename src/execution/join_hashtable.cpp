@@ -2102,7 +2102,7 @@ data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
 	return aux_next_ptrs[dict_idx];
 }
 
-void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk &result,
+void JoinHashTable::EmitDictVectors(const data_ptr_t *row_ptrs, idx_t count, DataChunk &result,
                                     idx_t rhs_col_offset) const {
 	D_ASSERT(output_columns.size() == dict_arrays.size());
 	SelectionVector build_sel_vec(count);
@@ -2111,11 +2111,11 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, idx_t count, DataChunk
 	}
 	for (idx_t col_idx = 0; col_idx < output_columns.size(); col_idx++) {
 		auto &vector = result.data[rhs_col_offset + col_idx];
-		vector.Dictionary(dict_arrays[col_idx], build_sel_vec);
+		vector.Dictionary(dict_arrays[col_idx], build_sel_vec, count);
 	}
 }
 
-void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count,
+void JoinHashTable::EmitDictVectors(const data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count,
                                     DataChunk &result, idx_t rhs_col_offset) const {
 	D_ASSERT(output_columns.size() == dict_arrays.size());
 	SelectionVector build_sel_vec(count);
@@ -2125,7 +2125,7 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector 
 	}
 	for (idx_t col_idx = 0; col_idx < output_columns.size(); col_idx++) {
 		auto &vector = result.data[rhs_col_offset + col_idx];
-		vector.Dictionary(dict_arrays[col_idx], build_sel_vec);
+		vector.Dictionary(dict_arrays[col_idx], build_sel_vec, count);
 	}
 }
 
@@ -2154,7 +2154,7 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 	} while (iterator.Next());
 	D_ASSERT(collected == build_count);
 
-	Vector row_pointer_vector(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()));
+	Vector row_pointer_vector(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()), build_count);
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
 		const auto &type = op.rhs_output_columns.col_types[col_idx];
