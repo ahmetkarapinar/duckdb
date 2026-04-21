@@ -2015,15 +2015,49 @@ idx_t JoinHashTable::ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_out
 
 bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external,
                                              idx_t probe_cardinality) const {
-	const DictionaryEmissionActivation activation {
-	    external,
-	    Count(),
-	    ComputeBuildPayloadBytes(op.rhs_output_columns.col_types),
-	    probe_cardinality,
-	    join_type,
-	    !op.rhs_output_columns.col_types.empty(),
-	};
-	return activation.ShouldActivate();
+	// external joins partition and rebuild, invalidating row pointers and TDC memory
+	if (external) {
+		return false;
+	}
+	// SINGLE joins emit NULLs into flat vectors via FlatVector::SetNull, which has no
+	// dictionary-vector equivalent (Vector::validity is protected)
+	if (join_type == JoinType::SINGLE) {
+		return false;
+	}
+	// nothing to dictionary-encode if no build columns are projected
+	if (op.rhs_output_columns.col_types.empty()) {
+		return false;
+	}
+	// nothing to dictionary-encode if the build side is empty
+	if (Count() == 0) {
+		return false;
+	}
+	// skip when the probe side is too small to amortize Phase A/B setup
+	if (probe_cardinality < DictionaryEmissionActivation::MIN_PROBE_ROWS) {
+		return false;
+	}
+	// skip when per-row savings are unlikely to amortize Phase A/B setup
+	if (probe_cardinality < DictionaryEmissionActivation::PROBE_BUILD_RATIO * Count()) {
+		return false;
+	}
+	// Vector::Dictionary does not support nested types; mirror CanDoPerfectHashJoin's exclusion
+	for (const auto &type : op.rhs_output_columns.col_types) {
+		switch (type.InternalType()) {
+		case PhysicalType::STRUCT:
+		case PhysicalType::LIST:
+		case PhysicalType::ARRAY:
+			return false;
+		default:
+			break;
+		}
+	}
+	// cap Phase A's dictionary allocation to keep the arrays in L3 (expensive check — kept last
+	// so cheaper gates filter out ineligible cases first)
+	if (ComputeBuildPayloadBytes(op.rhs_output_columns.col_types) >
+	    DictionaryEmissionActivation::MAX_BUILD_PAYLOAD_BYTES) {
+		return false;
+	}
+	return true;
 }
 
 data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
@@ -2066,16 +2100,8 @@ void JoinHashTable::EmitDictVectors(data_ptr_t *row_ptrs, const SelectionVector 
 void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 	auto &collection = *data_collection;
 	const auto build_count = collection.Count();
-	if (build_count == 0) {
-		return;
-	}
-
-	// Vector::Dictionary() does not support STRUCT
-	for (auto &type : op.rhs_output_columns.col_types) {
-		if (type.InternalType() == PhysicalType::STRUCT) {
-			return;
-		}
-	}
+	// CanUseDictionaryEmission guarantees a non-empty build side and non-nested RHS output types
+	D_ASSERT(build_count > 0);
 
 	// pin every chunk so the collected row pointers remain valid until EmbedDictionaryIndices runs
 	// in FinishEvent, after the parallel finalize tasks have completed

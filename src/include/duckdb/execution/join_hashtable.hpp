@@ -48,8 +48,7 @@ private:
 	JoinHTScanState(const JoinHTScanState &) = delete;
 };
 
-//! Activation inputs, thresholds, and gating decision for small-build-side dictionary emission.
-//! ShouldActivate() returns true iff every gate passes.
+//! Threshold constants gating small-build-side dictionary emission.
 struct DictionaryEmissionActivation {
 	//! Caps Phase A's dictionary allocation (build_count * sum of RHS output column widths).
 	//! 8 MiB keeps the arrays in L3 and implicitly bounds aux_next_ptrs to the same budget.
@@ -58,35 +57,6 @@ struct DictionaryEmissionActivation {
 	static constexpr idx_t MIN_PROBE_ROWS = 262144;
 	//! Below this ratio, per-row savings are unlikely to amortize Phase A/B setup
 	static constexpr idx_t PROBE_BUILD_RATIO = 100;
-
-	bool external;
-	idx_t build_count;
-	idx_t build_payload_bytes;
-	idx_t probe_cardinality;
-	JoinType join_type;
-	bool rhs_has_output_columns;
-
-	bool ShouldActivate() const {
-		if (external) {
-			return false;
-		}
-		if (join_type == JoinType::SINGLE) {
-			return false;
-		}
-		if (!rhs_has_output_columns) {
-			return false;
-		}
-		if (build_payload_bytes > MAX_BUILD_PAYLOAD_BYTES) {
-			return false;
-		}
-		if (probe_cardinality < MIN_PROBE_ROWS) {
-			return false;
-		}
-		if (probe_cardinality < PROBE_BUILD_RATIO * build_count) {
-			return false;
-		}
-		return true;
-	}
 };
 
 //! JoinHashTable is a linear probing HT that is used for computing joins
@@ -389,8 +359,7 @@ public:
 	//! Sum of InternalType.Size() over the RHS output types times Count() — the exact footprint
 	//! Phase A would allocate. Excludes key columns (not materialized into dictionary arrays).
 	idx_t ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_output_types) const;
-	//! Returns true iff small-build-side dictionary emission should activate. Populates a
-	//! DictionaryEmissionActivation and delegates to ShouldActivate().
+	//! Returns true iff small-build-side dictionary emission should activate.
 	bool CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external, idx_t probe_cardinality) const;
 
 	struct {
