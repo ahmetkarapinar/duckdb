@@ -1304,8 +1304,8 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_da
 				// Fully mark chain as found
 				while (true) {
 					// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
-					// threads Technically it is, but it does not matter, since the only value that can be written
-					// is "true"
+					// threads Technically it is, but it does not matter, since the only value that can be written is
+					// "true"
 					Store<bool>(true, ptr + ht.tuple_size);
 					auto next_ptr = ht.GetNextPointer(ptr);
 					if (!next_ptr) {
