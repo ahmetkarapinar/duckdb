@@ -1202,7 +1202,7 @@ void ScanStructure::NextInnerJoin(DataChunk &keys, DataChunk &probe_data, DataCh
 		}
 		result.SetCardinality(base_count);
 
-		// gather RHS vectors
+		// 2) gather RHS vectors
 		if (ht.use_dict_emission) {
 			auto rhs_ptrs = FlatVector::GetData<data_ptr_t>(rhs_pointers);
 			ht.EmitDictVectors(rhs_ptrs, base_count, result, ht.lhs_output_in_probe.size());
@@ -2046,7 +2046,6 @@ bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool ex
 			break;
 		}
 	}
-	// cap Phase A's dictionary allocation to keep the arrays in L3
 	if (ComputeBuildPayloadBytes(op.rhs_output_columns.col_types) >
 	    DictionaryEmissionActivation::MAX_BUILD_PAYLOAD_BYTES) {
 		return false;
@@ -2081,7 +2080,7 @@ void JoinHashTable::EmitDictVectors(const data_ptr_t *row_ptrs, const SelectionV
 	}
 }
 
-void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
+void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	auto &collection = *data_collection;
 	const auto build_count = collection.Count();
 	// preconditions enforced by CanUseDictionaryEmission
@@ -2089,9 +2088,9 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 	// dict index is a uint32_t; assert defensively if MAX_BUILD_PAYLOAD_BYTES is ever relaxed
 	D_ASSERT(build_count <= NumericLimits<uint32_t>::Maximum());
 
-	// captured row pointers stay valid through Phase B because the in-memory TDC owns its
-	// BufferHandles for its lifetime; FinishEvent verifies this before calling EmbedDictionaryIndices
-	prepared_row_ptrs.resize(build_count);
+	// collect a row pointer per build row; the TDC holds its own BufferHandles for its lifetime,
+	// and FinishEvent has already verified everything is pinned before calling us
+	vector<data_ptr_t> row_ptrs(build_count);
 	JoinHTScanState scan_state(collection, 0, collection.ChunkCount(),
 	                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
 	idx_t collected = 0;
@@ -2100,13 +2099,14 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 	do {
 		const auto chunk_count = iterator.GetCurrentChunkCount();
 		for (idx_t i = 0; i < chunk_count; i++) {
-			prepared_row_ptrs[collected + i] = chunk_row_locations[i];
+			row_ptrs[collected + i] = chunk_row_locations[i];
 		}
 		collected += chunk_count;
 	} while (iterator.Next());
 	D_ASSERT(collected == build_count);
 
-	Vector row_pointer_vector(LogicalType::POINTER, data_ptr_cast(prepared_row_ptrs.data()), build_count);
+	// gather RHS output columns into columnar dictionary arrays
+	Vector row_pointer_vector(LogicalType::POINTER, data_ptr_cast(row_ptrs.data()), build_count);
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
 		const auto &type = op.rhs_output_columns.col_types[col_idx];
@@ -2115,30 +2115,21 @@ void JoinHashTable::PrepareDictionaryArrays(const PhysicalHashJoin &op) {
 		collection.Gather(row_pointer_vector, sel, build_count, output_col_idx, dict_entry->data, sel, nullptr);
 		dict_arrays.emplace_back(std::move(dict_entry));
 	}
-	dict_arrays_prepared = true;
-}
 
-void JoinHashTable::EmbedDictionaryIndices() {
-	D_ASSERT(dict_arrays_prepared);
-	const auto build_count = prepared_row_ptrs.size();
-	D_ASSERT(build_count > 0);
-	// dict index is a uint32_t; assert defensively if MAX_BUILD_PAYLOAD_BYTES is ever relaxed
-	D_ASSERT(build_count <= NumericLimits<uint32_t>::Maximum());
-
-	// save chain pointers before overwriting NEXT_PTR; GetNextPointer reads them back during probing
+	// save chain pointers before overwriting NEXT_PTR; GetNextPointer reads them back
 	if (chains_longer_than_one) {
 		aux_next_ptrs.resize(build_count);
 		for (idx_t i = 0; i < build_count; i++) {
-			aux_next_ptrs[i] = LoadPointer(prepared_row_ptrs[i] + pointer_offset);
+			aux_next_ptrs[i] = LoadPointer(row_ptrs[i] + pointer_offset);
 		}
 	}
 
+	// embed the dict index into NEXT_PTR; GetNextPointer now resolves chains via aux_next_ptrs
 	for (idx_t i = 0; i < build_count; i++) {
-		Store<uint32_t>(static_cast<uint32_t>(i), prepared_row_ptrs[i] + pointer_offset);
+		Store<uint32_t>(static_cast<uint32_t>(i), row_ptrs[i] + pointer_offset);
 	}
 
 	use_dict_emission = true;
-	prepared_row_ptrs.clear();
 }
 
 } // namespace duckdb

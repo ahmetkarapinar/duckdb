@@ -755,9 +755,10 @@ public:
 		}
 		sink.hash_table->GetDataCollection().VerifyEverythingPinned();
 
-		// dictionary emission Phase B: chains are written, overwrite NEXT_PTR with the dict index
-		if (sink.hash_table->dict_arrays_prepared) {
-			sink.hash_table->EmbedDictionaryIndices();
+		// chains are final; materialize dict_arrays and overwrite NEXT_PTR with the dict index
+		if (sink.hash_table->CanUseDictionaryEmission(sink.op, sink.external,
+		                                              sink.op.children[0].get().estimated_cardinality)) {
+			sink.hash_table->BuildDictionaryArrays(sink.op);
 		}
 
 		sink.hash_table->finalized = true;
@@ -1303,11 +1304,6 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// In case of a large build side or duplicates, use regular hash join
 	if (!use_perfect_hash) {
-		// dictionary emission Phase A: pre-materialize RHS output columns
-		if (ht.CanUseDictionaryEmission(*this, sink.external, children[0].get().estimated_cardinality)) {
-			ht.PrepareDictionaryArrays(*this);
-		}
-
 		sink.ScheduleFinalize(pipeline, event);
 	}
 	sink.finalized = true;

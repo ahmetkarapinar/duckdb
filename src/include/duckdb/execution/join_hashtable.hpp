@@ -51,11 +51,11 @@ private:
 
 //! Threshold constants gating small-build-side dictionary emission
 struct DictionaryEmissionActivation {
-	//! Caps Phase A's dict_arrays allocation; 8 MiB keeps them in L3 and bounds aux_next_ptrs
+	//! Caps the dict_arrays allocation; 8 MiB keeps them in L3 and bounds aux_next_ptrs
 	static constexpr idx_t MAX_BUILD_PAYLOAD_BYTES = 8ULL * 1024ULL * 1024ULL;
-	//! Below this, Phase A setup is not amortized by probe-side savings
+	//! Below this, dictionary-emission setup is not amortized by probe-side savings
 	static constexpr idx_t MIN_PROBE_ROWS = 262144;
-	//! Below this ratio, per-row savings are unlikely to amortize Phase A/B setup
+	//! Below this ratio, per-row savings are unlikely to amortize the setup cost
 	static constexpr idx_t PROBE_BUILD_RATIO = 100;
 };
 
@@ -239,10 +239,9 @@ public:
 	//! Fill the pointer with all the addresses from the hashtable for full scan
 	static idx_t FillWithHTOffsets(JoinHTScanState &state, Vector &addresses);
 
-	//! Dictionary emission Phase A: pre-materialize RHS output columns; runs before ScheduleFinalize
-	void PrepareDictionaryArrays(const PhysicalHashJoin &op);
-	//! Dictionary emission Phase B: save NEXT_PTR into aux_next_ptrs, then overwrite it with the dict index
-	void EmbedDictionaryIndices();
+	//! Pre-materialize RHS output columns into dict_arrays and embed the dict index into NEXT_PTR;
+	//! called once from HashJoinFinalizeEvent::FinishEvent, after all finalize tasks have completed.
+	void BuildDictionaryArrays(const PhysicalHashJoin &op);
 	//! Emit dictionary vectors for row_ptrs[0..count)
 	void EmitDictVectors(const data_ptr_t *row_ptrs, idx_t count, DataChunk &result, idx_t rhs_col_offset) const;
 	//! Emit dictionary vectors for row_ptrs[ptr_sel[0..count)]
@@ -352,18 +351,14 @@ public:
 	//! Mapping from lhs_output_columns positions to lhs_probe_data positions
 	vector<idx_t> lhs_output_in_probe;
 
-	//! True once Phase B has embedded dictionary indices into NEXT_PTR
+	//! True once BuildDictionaryArrays has embedded dictionary indices into NEXT_PTR
 	bool use_dict_emission = false;
-	//! True once Phase A has populated dict_arrays and prepared_row_ptrs
-	bool dict_arrays_prepared = false;
 	//! Pre-materialized columnar data, one entry per RHS output column
 	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
 	//! Saved NEXT_PTR values, indexed by dict index; only populated when chains_longer_than_one
 	vector<data_ptr_t> aux_next_ptrs;
-	//! Row pointers collected during Phase A, consumed by Phase B
-	vector<data_ptr_t> prepared_row_ptrs;
 
-	//! Total bytes Phase A would allocate across dict_arrays for the given RHS output types
+	//! Total bytes the dict_arrays allocation would cost for the given RHS output types
 	idx_t ComputeBuildPayloadBytes(const vector<LogicalType> &rhs_output_types) const;
 	//! Returns true iff small-build-side dictionary emission should activate
 	bool CanUseDictionaryEmission(const PhysicalHashJoin &op, bool external, idx_t probe_cardinality) const;
