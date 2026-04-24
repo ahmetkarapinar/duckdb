@@ -1078,24 +1078,13 @@ void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_
 	}
 
 	// now for all the pointers, we move on to the next set of pointers
-	// hoist the dict-emission check so the common path keeps the original inlined LoadPointer
 	idx_t new_count = 0;
 	auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(this->pointers);
-	if (ht.use_dict_emission) {
-		for (idx_t i = 0; i < sel_count; i++) {
-			auto idx = sel.get_index(i);
-			ptrs[idx] = ht.GetNextPointer(ptrs[idx]);
-			if (ptrs[idx]) {
-				this->sel_vector.set_index(new_count++, idx);
-			}
-		}
-	} else {
-		for (idx_t i = 0; i < sel_count; i++) {
-			auto idx = sel.get_index(i);
-			ptrs[idx] = LoadPointer(ptrs[idx] + ht.pointer_offset);
-			if (ptrs[idx]) {
-				this->sel_vector.set_index(new_count++, idx);
-			}
+	for (idx_t i = 0; i < sel_count; i++) {
+		auto idx = sel.get_index(i);
+		ptrs[idx] = ht.GetNextPointer(ptrs[idx]);
+		if (ptrs[idx]) {
+			this->sel_vector.set_index(new_count++, idx);
 		}
 	}
 	this->count = new_count;
@@ -1304,50 +1293,25 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_da
 
 		if (ht.non_equality_predicates.empty() && !ht.residual_predicate) {
 			// we only have equality predicates - the match is found for the entire chain
-			// hoist the dict-emission check so the common path keeps the original inlined LoadPointer
-			if (ht.use_dict_emission) {
-				for (idx_t i = 0; i < result_count; i++) {
-					const auto idx = chain_match_sel_vector.get_index(i);
-					auto &ptr = ptrs[idx];
-					if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
-						ptr = ht.dead_end.get();
-						continue;
-					}
-
-					// Fully mark chain as found
-					while (true) {
-						// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
-						// threads Technically it is, but it does not matter, since the only value that can be written
-						// is "true"
-						Store<bool>(true, ptr + ht.tuple_size);
-						auto next_ptr = ht.GetNextPointer(ptr);
-						if (!next_ptr) {
-							break;
-						}
-						ptr = next_ptr;
-					}
+			for (idx_t i = 0; i < result_count; i++) {
+				const auto idx = chain_match_sel_vector.get_index(i);
+				auto &ptr = ptrs[idx];
+				if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
+					ptr = ht.dead_end.get();
+					continue;
 				}
-			} else {
-				for (idx_t i = 0; i < result_count; i++) {
-					const auto idx = chain_match_sel_vector.get_index(i);
-					auto &ptr = ptrs[idx];
-					if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
-						ptr = ht.dead_end.get();
-						continue;
-					}
 
-					// Fully mark chain as found
-					while (true) {
-						// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
-						// threads Technically it is, but it does not matter, since the only value that can be written
-						// is "true"
-						Store<bool>(true, ptr + ht.tuple_size);
-						auto next_ptr = LoadPointer(ptr + ht.pointer_offset);
-						if (!next_ptr) {
-							break;
-						}
-						ptr = next_ptr;
+				// Fully mark chain as found
+				while (true) {
+					// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
+					// threads Technically it is, but it does not matter, since the only value that can be written
+					// is "true"
+					Store<bool>(true, ptr + ht.tuple_size);
+					auto next_ptr = ht.GetNextPointer(ptr);
+					if (!next_ptr) {
+						break;
 					}
+					ptr = next_ptr;
 				}
 			}
 		} else {
@@ -2088,18 +2052,6 @@ bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool ex
 		return false;
 	}
 	return true;
-}
-
-data_ptr_t JoinHashTable::GetNextPointer(data_ptr_t row_ptr) const {
-	if (!use_dict_emission) {
-		return LoadPointer(row_ptr + pointer_offset);
-	}
-	if (!chains_longer_than_one) {
-		// aux_next_ptrs is empty in this case
-		return nullptr;
-	}
-	const auto dict_idx = Load<uint32_t>(row_ptr + pointer_offset);
-	return aux_next_ptrs[dict_idx];
 }
 
 void JoinHashTable::EmitDictVectors(const data_ptr_t *row_ptrs, idx_t count, DataChunk &result,
