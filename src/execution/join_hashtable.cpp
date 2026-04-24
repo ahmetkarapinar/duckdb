@@ -2050,6 +2050,8 @@ bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool ex
 	    DictionaryEmissionActivation::MAX_BUILD_PAYLOAD_BYTES) {
 		return false;
 	}
+	// Count() fits in the uint32_t dict index stored into NEXT_PTR by BuildDictionaryArrays
+	D_ASSERT(Count() <= NumericLimits<uint32_t>::Maximum());
 	return true;
 }
 
