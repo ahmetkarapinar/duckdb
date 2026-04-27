@@ -2112,23 +2112,15 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 
 	// collect a row pointer per build row; the TDC holds its own BufferHandles for its lifetime,
 	// and FinishEvent has already verified everything is pinned before calling us
-	vector<data_ptr_t> row_ptrs(build_count);
+	Vector row_pointer_vector(LogicalType::POINTER, build_count);
 	JoinHTScanState scan_state(collection, 0, collection.ChunkCount(),
 	                           TupleDataPinProperties::KEEP_EVERYTHING_PINNED);
-	idx_t collected = 0;
-	auto &iterator = scan_state.iterator;
-	const auto chunk_row_locations = iterator.GetRowLocations();
-	do {
-		const auto chunk_count = iterator.GetCurrentChunkCount();
-		for (idx_t i = 0; i < chunk_count; i++) {
-			row_ptrs[collected + i] = chunk_row_locations[i];
-		}
-		collected += chunk_count;
-	} while (iterator.Next());
+	const auto collected = FillWithHTOffsets(scan_state, row_pointer_vector);
 	D_ASSERT(collected == build_count);
+	(void)collected;
+	const auto row_ptrs = FlatVector::GetData<data_ptr_t>(row_pointer_vector);
 
 	// gather RHS output columns into columnar dictionary arrays
-	Vector row_pointer_vector(LogicalType::POINTER, data_ptr_cast(row_ptrs.data()), build_count);
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
 		const auto &type = op.rhs_output_columns.col_types[col_idx];
