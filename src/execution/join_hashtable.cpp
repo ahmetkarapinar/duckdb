@@ -1071,23 +1071,31 @@ idx_t ScanStructure::ScanInnerJoin(DataChunk &keys, DataChunk &probe_data, Selec
 	}
 }
 
+template <bool USE_DICT_EMISSION>
+static void AdvancePointersLoop(JoinHashTable &ht, Vector &pointers, SelectionVector &out_sel,
+                                const SelectionVector &sel, const idx_t sel_count, idx_t &out_count) {
+	idx_t new_count = 0;
+	auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(pointers);
+	for (idx_t i = 0; i < sel_count; i++) {
+		auto idx = sel.get_index(i);
+		ptrs[idx] = ht.GetNextPointer<USE_DICT_EMISSION>(ptrs[idx]);
+		if (ptrs[idx]) {
+			out_sel.set_index(new_count++, idx);
+		}
+	}
+	out_count = new_count;
+}
+
 void ScanStructure::AdvancePointers(const SelectionVector &sel, const idx_t sel_count) {
 	if (!ht.chains_longer_than_one) {
 		this->count = 0;
 		return;
 	}
-
-	// now for all the pointers, we move on to the next set of pointers
-	idx_t new_count = 0;
-	auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(this->pointers);
-	for (idx_t i = 0; i < sel_count; i++) {
-		auto idx = sel.get_index(i);
-		ptrs[idx] = ht.GetNextPointer(ptrs[idx]);
-		if (ptrs[idx]) {
-			this->sel_vector.set_index(new_count++, idx);
-		}
+	if (ht.use_dict_emission) {
+		AdvancePointersLoop<true>(ht, pointers, sel_vector, sel, sel_count, count);
+	} else {
+		AdvancePointersLoop<false>(ht, pointers, sel_vector, sel, sel_count, count);
 	}
-	this->count = new_count;
 }
 
 void ScanStructure::AdvancePointers() {
@@ -1285,6 +1293,33 @@ void ScanStructure::NextAntiJoin(DataChunk &keys, DataChunk &probe_data, DataChu
 	finished = true;
 }
 
+template <bool USE_DICT_EMISSION>
+static void MarkChainsAsFoundLoop(JoinHashTable &ht, data_ptr_t ptrs[],
+                              const SelectionVector &chain_match_sel_vector, const idx_t result_count,
+                              const data_ptr_t dead_end_ptr) {
+	for (idx_t i = 0; i < result_count; i++) {
+		const auto idx = chain_match_sel_vector.get_index(i);
+		auto &ptr = ptrs[idx];
+		if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
+			ptr = dead_end_ptr;
+			continue;
+		}
+
+		// Fully mark chain as found
+		while (true) {
+			// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
+			// threads Technically it is, but it does not matter, since the only value that can be written is
+			// "true"
+			Store<bool>(true, ptr + ht.tuple_size);
+			auto next_ptr = ht.GetNextPointer<USE_DICT_EMISSION>(ptr);
+			if (!next_ptr) {
+				break;
+			}
+			ptr = next_ptr;
+		}
+	}
+}
+
 void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_data) {
 	const auto ptrs = FlatVector::GetDataMutable<data_ptr_t>(pointers);
 	while (!PointersExhausted()) {
@@ -1293,26 +1328,11 @@ void ScanStructure::NextRightSemiOrAntiJoin(DataChunk &keys, DataChunk &probe_da
 
 		if (ht.non_equality_predicates.empty() && !ht.residual_predicate) {
 			// we only have equality predicates - the match is found for the entire chain
-			for (idx_t i = 0; i < result_count; i++) {
-				const auto idx = chain_match_sel_vector.get_index(i);
-				auto &ptr = ptrs[idx];
-				if (Load<bool>(ptr + ht.tuple_size)) { // Early out: chain has been fully marked as found before
-					ptr = ht.dead_end.get();
-					continue;
-				}
-
-				// Fully mark chain as found
-				while (true) {
-					// NOTE: threadsan reports this as a data race because this can be set concurrently by separate
-					// threads Technically it is, but it does not matter, since the only value that can be written is
-					// "true"
-					Store<bool>(true, ptr + ht.tuple_size);
-					auto next_ptr = ht.GetNextPointer(ptr);
-					if (!next_ptr) {
-						break;
-					}
-					ptr = next_ptr;
-				}
+			const auto dead_end_ptr = ht.dead_end.get();
+			if (ht.use_dict_emission) {
+				MarkChainsAsFoundLoop<true>(ht, ptrs, chain_match_sel_vector, result_count, dead_end_ptr);
+			} else {
+				MarkChainsAsFoundLoop<false>(ht, ptrs, chain_match_sel_vector, result_count, dead_end_ptr);
 			}
 		} else {
 			// we have non-equality predicates - we need to evaluate the join condition for every row

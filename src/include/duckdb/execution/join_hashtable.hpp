@@ -8,8 +8,6 @@
 
 #pragma once
 
-#include "duckdb/common/enums/join_type.hpp"
-#include "duckdb/common/helper.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types/column/column_data_consumer.hpp"
 #include "duckdb/common/types/column/partitioned_column_data.hpp"
@@ -247,16 +245,17 @@ public:
 	//! Emit dictionary vectors for row_ptrs[ptr_sel[0..count)]
 	void EmitDictVectors(const data_ptr_t *row_ptrs, const SelectionVector &ptr_sel, idx_t count, DataChunk &result,
 	                     idx_t rhs_col_offset) const;
-	//! Follow the chain pointer; when dict emission is active, resolves via aux_next_ptrs
+	//! Follow the chain pointer; when USE_DICT_EMISSION, resolves via aux_next_ptrs
+	template <bool USE_DICT_EMISSION>
 	inline data_ptr_t GetNextPointer(data_ptr_t row_ptr) const {
-		if (!use_dict_emission) {
-			return cast_uint64_to_pointer(Load<uint64_t>(row_ptr + pointer_offset));
+		if (USE_DICT_EMISSION) {
+			if (!chains_longer_than_one) {
+				// aux_next_ptrs is empty in this case
+				return nullptr;
+			}
+			return aux_next_ptrs[Load<uint32_t>(row_ptr + pointer_offset)];
 		}
-		if (!chains_longer_than_one) {
-			// aux_next_ptrs is empty in this case
-			return nullptr;
-		}
-		return aux_next_ptrs[Load<uint32_t>(row_ptr + pointer_offset)];
+		return cast_uint64_to_pointer(Load<uint64_t>(row_ptr + pointer_offset));
 	}
 
 	idx_t Count() const {
