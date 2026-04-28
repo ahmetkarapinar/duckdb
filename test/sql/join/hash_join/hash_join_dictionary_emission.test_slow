@@ -366,6 +366,70 @@ ten	26220
 three	26220
 two	26220
 
+# NULL keys on the build side via IS NOT DISTINCT FROM
+# probe has no NULL keys, so build NULL rows still match nothing here
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM big_probe p JOIN build_null_keys b ON p.k IS NOT DISTINCT FROM b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# NULL keys on both sides: IS NOT DISTINCT FROM treats NULL as equal to NULL
+statement ok
+CREATE TABLE big_probe_with_nulls AS
+SELECT id, k FROM big_probe
+UNION ALL
+SELECT 2000000 + i, NULL FROM range(5) t(i);
+
+# IS NOT DISTINCT FROM: 5 NULL probe rows match each of the 2 NULL build rows
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM big_probe_with_nulls p JOIN build_null_keys b ON p.k IS NOT DISTINCT FROM b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+null-row-1	5
+null-row-2	5
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
+# regular equality on the same data: NULL probe rows match nothing (NULL = NULL is FALSE)
+query II
+SELECT b.name, COUNT(*) AS cnt
+FROM big_probe_with_nulls p JOIN build_null_keys b ON p.k = b.k
+GROUP BY b.name
+ORDER BY b.name;
+----
+eight	26220
+five	26220
+four	26220
+nine	26220
+one	26220
+seven	26220
+six	26220
+ten	26220
+three	26220
+two	26220
+
 # NULL values in the build payload
 statement ok
 CREATE TABLE build_null_payload (k VARCHAR, name VARCHAR, score INTEGER);
