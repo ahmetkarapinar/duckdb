@@ -22,11 +22,7 @@ SELECT CAST(n_nationkey AS VARCHAR) AS n_nation_id,
 FROM   tpch_sf10.nation;
 
 run
-SELECT n_name,
-       COUNT(*)        AS cust_count,
-       AVG(c_acctbal)  AS avg_balance
+SELECT c.c_custkey, c.c_name, c.c_acctbal, n.n_name
 FROM   customer_v c
 JOIN   nation_v   n
-       ON c.c_nation_id = n.n_nation_id
-GROUP  BY n_name
-ORDER  BY n_name;
+       ON c.c_nation_id = n.n_nation_id;

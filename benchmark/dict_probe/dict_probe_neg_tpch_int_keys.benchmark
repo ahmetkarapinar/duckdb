@@ -11,11 +11,7 @@ USE tpch_sf10;
 SET threads = 1;
 
 run
-SELECT n_name,
-       COUNT(*)        AS cust_count,
-       AVG(c_acctbal)  AS avg_balance
+SELECT c.c_custkey, c.c_name, c.c_acctbal, n.n_name
 FROM   tpch_sf10.customer c
 JOIN   tpch_sf10.nation   n
-       ON c.c_nationkey = n.n_nationkey
-GROUP  BY n_name
-ORDER  BY n_name;
+       ON c.c_nationkey = n.n_nationkey;

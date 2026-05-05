@@ -27,10 +27,8 @@ SELECT CAST(w_warehouse_sk AS VARCHAR) AS w_warehouse_id,
 FROM   warehouse;
 
 run
-SELECT w_warehouse_name,
-       SUM(inv_quantity_on_hand) AS total_qty
+SELECT iv.inv_date_sk, iv.inv_item_sk, iv.inv_quantity_on_hand,
+       wv.w_warehouse_name, wv.w_state
 FROM   inventory_v iv
 JOIN   warehouse_v wv
-       ON iv.inv_warehouse_id = wv.w_warehouse_id
-GROUP  BY w_warehouse_name
-ORDER  BY w_warehouse_name;
+       ON iv.inv_warehouse_id = wv.w_warehouse_id;

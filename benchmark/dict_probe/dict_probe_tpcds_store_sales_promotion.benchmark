@@ -28,10 +28,8 @@ SELECT CAST(p_promo_sk AS VARCHAR) AS p_promo_id,
 FROM   promotion;
 
 run
-SELECT p_channel_tv,
-       SUM(ss_ext_sales_price) AS rev
+SELECT ss.ss_sold_date_sk, ss.ss_item_sk, ss.ss_ext_sales_price,
+       p.p_channel_email, p.p_channel_tv
 FROM   store_sales_v ss
 JOIN   promotion_v   p
-       ON ss.ss_promo_id = p.p_promo_id
-GROUP  BY p_channel_tv
-ORDER  BY p_channel_tv;
+       ON ss.ss_promo_id = p.p_promo_id;

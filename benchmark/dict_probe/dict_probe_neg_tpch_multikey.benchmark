@@ -15,12 +15,9 @@ SELECT DISTINCT l_shipmode  AS shipmode,
 FROM tpch_sf10.lineitem;
 
 run
-SELECT shipmode,
-       rflag,
-       SUM(l_extendedprice * (1 - l_discount)) AS revenue
+SELECT li.l_orderkey, li.l_extendedprice, li.l_discount,
+       d.shipmode, d.rflag
 FROM   tpch_sf10.lineitem li
 JOIN   dim_shipmode_returnflag d
        ON li.l_shipmode   = d.shipmode
-      AND li.l_returnflag = d.rflag
-GROUP  BY shipmode, rflag
-ORDER  BY shipmode, rflag;
+      AND li.l_returnflag = d.rflag;

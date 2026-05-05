@@ -20,10 +20,7 @@ SELECT DISTINCT l_shipmode AS shipmode,
 FROM tpch_sf10.lineitem;
 
 run
-SELECT speed_class,
-       SUM(l_extendedprice * (1 - l_discount)) AS revenue
+SELECT l_orderkey, l_extendedprice, l_discount, speed_class
 FROM   tpch_sf10.lineitem
 JOIN   dim_shipmode
-       ON lineitem.l_shipmode = dim_shipmode.shipmode
-GROUP  BY speed_class
-ORDER  BY speed_class;
+       ON lineitem.l_shipmode = dim_shipmode.shipmode;

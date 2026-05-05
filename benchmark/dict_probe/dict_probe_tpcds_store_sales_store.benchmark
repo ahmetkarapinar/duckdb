@@ -30,10 +30,9 @@ SELECT CAST(s_store_sk AS VARCHAR) AS s_store_id,
 FROM   store;
 
 run
-SELECT s_store_name,
-       SUM(ss_net_profit) AS profit
+SELECT ss.ss_sold_date_sk, ss.ss_item_sk, ss.ss_quantity,
+       ss.ss_sales_price, ss.ss_net_profit,
+       s.s_store_name, s.s_state
 FROM   store_sales_v ss
 JOIN   store_v       s
-       ON ss.ss_store_id = s.s_store_id
-GROUP  BY s_store_name
-ORDER  BY s_store_name;
+       ON ss.ss_store_id = s.s_store_id;
