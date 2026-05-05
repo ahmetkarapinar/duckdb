@@ -1,0 +1,26 @@
+# name: benchmark/dict_probe/dict_probe_neg_tpch_multikey.benchmark
+# description: Negative control for the dictionary-probing optimisation. Joins lineitem to a synthetic two-column dimension on (l_shipmode, l_returnflag) -- both naturally-VARCHAR columns that would individually be dict-encoded. Because the join has two equality conditions, the structural eligibility gate (conditions.size() == 1) routes the probe through the existing JoinHashTable::Probe() path, completely bypassing the wrapped ht_probe scalar function. Expected outcome: identical to today's path; must NOT regress.
+# group: [dict_probe]
+
+name dict_probe_neg_tpch_multikey
+group dict_probe
+
+load
+ATTACH '/Users/ahmetkarapinar/Desktop/tpch_sf10.db' AS tpch_sf10;
+USE tpch_sf10;
+SET threads = 1;
+CREATE OR REPLACE TEMP TABLE dim_shipmode_returnflag AS
+SELECT DISTINCT l_shipmode  AS shipmode,
+                l_returnflag AS rflag
+FROM tpch_sf10.lineitem;
+
+run
+SELECT shipmode,
+       rflag,
+       SUM(l_extendedprice * (1 - l_discount)) AS revenue
+FROM   tpch_sf10.lineitem li
+JOIN   dim_shipmode_returnflag d
+       ON li.l_shipmode   = d.shipmode
+      AND li.l_returnflag = d.rflag
+GROUP  BY shipmode, rflag
+ORDER  BY shipmode, rflag;

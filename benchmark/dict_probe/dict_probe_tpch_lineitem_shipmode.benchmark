@@ -1,0 +1,29 @@
+# name: benchmark/dict_probe/dict_probe_tpch_lineitem_shipmode.benchmark
+# description: Dictionary-probing optimisation: lineitem (60M, SF10) joined to a 7-row dim_shipmode on the naturally-VARCHAR l_shipmode column. Probe key arrives dict-encoded straight from storage (no cast). N/D ~= 8.6M, the highest-leverage TPC-H test for the wrapped ht_probe path's N->D->0 lookup reduction.
+# group: [dict_probe]
+
+name dict_probe_tpch_lineitem_shipmode
+group dict_probe
+
+load
+ATTACH '/Users/ahmetkarapinar/Desktop/tpch_sf10.db' AS tpch_sf10;
+USE tpch_sf10;
+SET threads = 1;
+CREATE OR REPLACE TEMP TABLE dim_shipmode AS
+SELECT DISTINCT l_shipmode AS shipmode,
+       CASE l_shipmode
+            WHEN 'AIR'     THEN 'fast'
+            WHEN 'REG AIR' THEN 'fast'
+            WHEN 'MAIL'    THEN 'slow'
+            ELSE 'medium'
+       END AS speed_class
+FROM tpch_sf10.lineitem;
+
+run
+SELECT speed_class,
+       SUM(l_extendedprice * (1 - l_discount)) AS revenue
+FROM   tpch_sf10.lineitem
+JOIN   dim_shipmode
+       ON lineitem.l_shipmode = dim_shipmode.shipmode
+GROUP  BY speed_class
+ORDER  BY speed_class;

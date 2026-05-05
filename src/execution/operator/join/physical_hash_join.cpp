@@ -13,6 +13,7 @@
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/hash_join_probe_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
@@ -25,6 +26,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
@@ -1319,7 +1321,8 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 class HashJoinOperatorState : public CachingOperatorState {
 public:
 	explicit HashJoinOperatorState(ClientContext &context, HashJoinGlobalSinkState &sink)
-	    : probe_executor(context), scan_structure(*sink.hash_table, join_key_state) {
+	    : probe_executor(context), scan_structure(*sink.hash_table, join_key_state),
+	      ht_probe_pointers(LogicalType::POINTER) {
 	}
 
 	DataChunk lhs_join_keys;
@@ -1335,11 +1338,38 @@ public:
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
 
+	//! Dictionary-aware probe machinery; only initialised when CanUseHTProbeFunction returns true
+	unique_ptr<ExpressionExecutor> ht_probe_executor;
+	unique_ptr<BoundFunctionExpression> ht_probe_expr;
+	Vector ht_probe_pointers;
+	DataChunk ht_probe_arg_chunk;
+	bool ht_probe_enabled = false;
+
 public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}
 };
+
+//! Whether the dict-aware probe wrapper applies to this operator. Limited to single-equality joins on a column
+//! reference LHS over an in-memory hash table, mirroring the project's supervisor-imposed scope.
+static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
+	if (sink.external) {
+		return false;
+	}
+	if (conditions.size() != 1) {
+		return false;
+	}
+	const auto &cond = conditions[0];
+	const auto cmp = cond.GetComparisonType();
+	if (cmp != ExpressionType::COMPARE_EQUAL && cmp != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return false;
+	}
+	if (cond.GetLHS().GetExpressionClass() != ExpressionClass::BOUND_REF) {
+		return false;
+	}
+	return true;
+}
 
 unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &context) const {
 	auto &allocator = BufferAllocator::Get(context.client);
@@ -1364,6 +1394,25 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 	if (sink.external) {
 		state->spill_chunk.Initialize(allocator, sink.probe_types);
 		sink.InitializeProbeSpill();
+	}
+
+	if (!sink.perfect_join_executor && CanUseHTProbeFunction(sink, conditions)) {
+		// build a single-expression executor over ht_probe(key) so the dict fast path inside
+		// TryExecuteDictionaryExpression can fire automatically when the LHS arrives as a storage dictionary
+		auto fun = HashJoinProbeScalarFun::GetFunction(condition_types[0]);
+		BoundScalarFunction bound_function(fun);
+
+		auto bind_data = make_uniq<HashJoinProbeFunctionData>(sink.hash_table.get(), condition_types[0]);
+
+		vector<unique_ptr<Expression>> children;
+		children.push_back(make_uniq<BoundReferenceExpression>(condition_types[0], idx_t(0)));
+
+		state->ht_probe_expr =
+		    make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), std::move(bind_data));
+		state->ht_probe_executor = make_uniq<ExpressionExecutor>(context.client);
+		state->ht_probe_executor->AddExpression(*state->ht_probe_expr);
+		state->ht_probe_arg_chunk.Initialize(allocator, vector<LogicalType> {condition_types[0]});
+		state->ht_probe_enabled = true;
 	}
 
 	return std::move(state);
@@ -1413,6 +1462,15 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
+		} else if (state.ht_probe_enabled) {
+			// route the probe through ht_probe(key); if the LHS is a storage dictionary the executor's generic
+			// fast path runs the function on D distinct codes (and reuses the cached output across batches)
+			state.ht_probe_arg_chunk.Reset();
+			state.ht_probe_arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
+			state.ht_probe_arg_chunk.SetCardinality(state.lhs_join_keys.size());
+			state.ht_probe_executor->ExecuteExpression(state.ht_probe_arg_chunk, state.ht_probe_pointers);
+			sink.hash_table->InitializeScanStructureFromPointers(state.scan_structure, state.lhs_join_keys,
+			                                                     state.join_key_state, state.ht_probe_pointers);
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}

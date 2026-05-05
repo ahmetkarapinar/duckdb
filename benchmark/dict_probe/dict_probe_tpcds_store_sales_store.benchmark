@@ -1,0 +1,39 @@
+# name: benchmark/dict_probe/dict_probe_tpcds_store_sales_store.benchmark
+# description: Dictionary-probing optimisation: TPC-DS store_sales (~28.8M, SF10) joined to store (~24 rows) on ss_store_sk pre-cast to VARCHAR. Canonical star-schema fact-vs-tiny-dimension shape; N/D ~= 1.2M. Easiest to motivate to a TPC-DS reviewer and the most representative end-to-end dictionary-probing test.
+# group: [dict_probe]
+
+name dict_probe_tpcds_store_sales_store
+group dict_probe
+
+require tpcds
+
+storage persistent
+
+cache tpcds_sf10.duckdb
+
+load
+SET threads = 1;
+CALL dsdgen(sf=10);
+CREATE OR REPLACE TABLE store_sales_v AS
+SELECT ss_sold_date_sk,
+       ss_item_sk,
+       CAST(ss_store_sk AS VARCHAR) AS ss_store_id,
+       ss_quantity,
+       ss_sales_price,
+       ss_net_profit
+FROM   store_sales
+WHERE  ss_store_sk IS NOT NULL;
+CREATE OR REPLACE TABLE store_v AS
+SELECT CAST(s_store_sk AS VARCHAR) AS s_store_id,
+       s_store_name,
+       s_state
+FROM   store;
+
+run
+SELECT s_store_name,
+       SUM(ss_net_profit) AS profit
+FROM   store_sales_v ss
+JOIN   store_v       s
+       ON ss.ss_store_id = s.s_store_id
+GROUP  BY s_store_name
+ORDER  BY s_store_name;

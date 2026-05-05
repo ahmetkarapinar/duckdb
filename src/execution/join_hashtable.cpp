@@ -846,6 +846,55 @@ void JoinHashTable::InitializeScanStructure(ScanStructure &scan_structure, DataC
 	}
 }
 
+void JoinHashTable::ProbeKeysToHeadPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state,
+                                            Vector &hashes_v, const SelectionVector *sel, idx_t &count,
+                                            Vector &pointers_result_v, SelectionVector &match_sel, bool has_sel) {
+	GetRowPointers(keys, key_state, state, hashes_v, sel, count, pointers_result_v, match_sel, has_sel);
+}
+
+void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_structure, DataChunk &keys,
+                                                        TupleDataChunkState &key_state, Vector &pointers) {
+	D_ASSERT(finalized);
+	D_ASSERT(Count() > 0);
+
+	// mirror InitializeScanStructure up to (but not including) the GetRowPointers call
+	scan_structure.is_null = false;
+	scan_structure.finished = false;
+	if (join_type != JoinType::INNER) {
+		memset(scan_structure.found_match.get(), 0, sizeof(bool) * STANDARD_VECTOR_SIZE);
+	}
+
+	TupleDataCollection::ToUnifiedFormat(key_state, keys);
+
+	const SelectionVector *current_sel;
+	const idx_t prepared_count =
+	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
+	scan_structure.has_null_value_filter = prepared_count < keys.size();
+
+	// pointers may arrive as a DICTIONARY_VECTOR from the dict fast path; route through UnifiedVectorFormat so
+	// the dict's selection vector and validity mask are honoured without a flat materialisation
+	UnifiedVectorFormat ptr_format;
+	pointers.ToUnifiedFormat(keys.size(), ptr_format);
+	const auto src_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(ptr_format);
+	const auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
+
+	// hits and misses are encoded in the validity mask (set by HashJoinProbeFunction); drop misses so the chain
+	// walker sees the same (pointers, sel_vector, count) shape that GetRowPointers produces in the direct path
+	idx_t kept = 0;
+	for (idx_t i = 0; i < prepared_count; i++) {
+		const auto row_index = current_sel->get_index(i);
+		const auto src_idx = ptr_format.sel->get_index(row_index);
+		if (ptr_format.validity.RowIsValid(src_idx)) {
+			dst_ptrs[row_index] = src_ptrs[src_idx];
+			scan_structure.sel_vector.set_index(kept++, row_index);
+		}
+	}
+	if (kept < prepared_count) {
+		scan_structure.has_null_value_filter = true;
+	}
+	scan_structure.count = kept;
+}
+
 void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
                           ProbeState &probe_state, optional_ptr<Vector> precomputed_hashes) {
 	const SelectionVector *current_sel;
