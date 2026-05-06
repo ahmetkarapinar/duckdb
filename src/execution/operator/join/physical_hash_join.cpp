@@ -1319,11 +1319,32 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
+//! Cluster of state needed by the dictionary-aware ht_probe wrapper. Allocated only when
+//! CanUseHTProbeFunction returns true, so non-eligible joins (multi-key, expression LHS, external,
+//! perfect-hash) pay no setup cost — including the STANDARD_VECTOR_SIZE * sizeof(data_ptr_t) buffer
+//! that pointers used to allocate unconditionally on the operator state. Member declaration order
+//! is load-bearing: ExpressionExecutor and its child ExpressionState objects keep raw pointers and
+//! references back into the expression, so expr is declared before executor to outlive it (members
+//! are destroyed in reverse declaration order).
+class HTProbeState {
+public:
+	HTProbeState(ClientContext &context, Allocator &allocator, unique_ptr<BoundFunctionExpression> expr_p,
+	             const LogicalType &key_type)
+	    : expr(std::move(expr_p)), executor(context), pointers(LogicalType::POINTER) {
+		executor.AddExpression(*expr);
+		arg_chunk.Initialize(allocator, vector<LogicalType> {key_type});
+	}
+
+	unique_ptr<BoundFunctionExpression> expr;
+	ExpressionExecutor executor;
+	Vector pointers;
+	DataChunk arg_chunk;
+};
+
 class HashJoinOperatorState : public CachingOperatorState {
 public:
 	explicit HashJoinOperatorState(ClientContext &context, HashJoinGlobalSinkState &sink)
-	    : probe_executor(context), scan_structure(*sink.hash_table, join_key_state),
-	      ht_probe_pointers(LogicalType::POINTER) {
+	    : probe_executor(context), scan_structure(*sink.hash_table, join_key_state) {
 	}
 
 	DataChunk lhs_join_keys;
@@ -1339,14 +1360,9 @@ public:
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
 
-	//! Dictionary-aware probe machinery, only initialised when CanUseHTProbeFunction allows it.
-	//! ht_probe_expr is declared before ht_probe_executor so the executor is destroyed first; the
-	//! executor's ExpressionState holds a reference to the expression and would otherwise dangle.
-	unique_ptr<BoundFunctionExpression> ht_probe_expr;
-	unique_ptr<ExpressionExecutor> ht_probe_executor;
-	Vector ht_probe_pointers;
-	DataChunk ht_probe_arg_chunk;
-	bool ht_probe_enabled = false;
+	//! Dictionary-aware probe wrapper, allocated only when CanUseHTProbeFunction returns true; null
+	//! otherwise so non-eligible joins remain bit-for-bit identical to today on setup and per chunk.
+	unique_ptr<HTProbeState> ht_probe;
 
 public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
@@ -1432,15 +1448,14 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 
 		auto bind_data = make_uniq<HashJoinProbeFunctionData>(sink.hash_table.get(), condition_types[0]);
 
+		// the BoundReferenceExpression resolves to HTProbeState::arg_chunk's only column (the LHS key)
+		static constexpr idx_t HT_PROBE_KEY_COLUMN_INDEX = 0;
 		vector<unique_ptr<Expression>> children;
-		children.push_back(make_uniq<BoundReferenceExpression>(condition_types[0], idx_t(0)));
+		children.push_back(make_uniq<BoundReferenceExpression>(condition_types[0], HT_PROBE_KEY_COLUMN_INDEX));
 
-		state->ht_probe_expr =
+		auto expr =
 		    make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), std::move(bind_data));
-		state->ht_probe_executor = make_uniq<ExpressionExecutor>(context.client);
-		state->ht_probe_executor->AddExpression(*state->ht_probe_expr);
-		state->ht_probe_arg_chunk.Initialize(allocator, vector<LogicalType> {condition_types[0]});
-		state->ht_probe_enabled = true;
+		state->ht_probe = make_uniq<HTProbeState>(context.client, allocator, std::move(expr), condition_types[0]);
 	}
 
 	return std::move(state);
@@ -1490,14 +1505,15 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
-		} else if (state.ht_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
+		} else if (state.ht_probe && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
 			// only route through ht_probe when the dict fast path will fire; otherwise the wrapper pays
 			// executor dispatch and an O(N) reshape with no algorithmic win
-			state.ht_probe_arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
-			state.ht_probe_arg_chunk.SetCardinality(state.lhs_join_keys.size());
-			state.ht_probe_executor->ExecuteExpression(state.ht_probe_arg_chunk, state.ht_probe_pointers);
+			auto &probe = *state.ht_probe;
+			probe.arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
+			probe.arg_chunk.SetCardinality(state.lhs_join_keys.size());
+			probe.executor.ExecuteExpression(probe.arg_chunk, probe.pointers);
 			sink.hash_table->InitializeScanStructureFromPointers(state.scan_structure, state.lhs_join_keys,
-			                                                     state.join_key_state, state.ht_probe_pointers);
+			                                                     state.join_key_state, probe.pointers);
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}

@@ -64,8 +64,14 @@ void HashJoinProbeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 
 	VectorOperations::Hash(local.single_key_chunk.data[0], local.hashes, count);
 
-	// the previous chunk's dict fast path may have wrapped result as a DictionaryBuffer (which does not
-	// support SetVectorType); re-allocate as a flat buffer so FlatVector::ValidityMutable below is valid
+	// We are on the regular-callback path: TryExecuteDictionaryExpression bailed despite the operator's
+	// LHSChunkIsDictionaryEligible gate letting this chunk through (the executor's chunk_fill_ratio gate
+	// fires for first-encounter dictionary ids whose size is in [STANDARD_VECTOR_SIZE, 20000]). A prior
+	// dict-fast-path call may have swapped `result`'s buffer for a DictionaryBuffer that does not support
+	// SetVectorType, so re-allocate as a fresh flat buffer to keep FlatVector::ValidityMutable below valid.
+	// Cost: one STANDARD_VECTOR_SIZE * sizeof(data_ptr_t) allocation on the first non-dict chunk after a
+	// dict-fast-path call, paid until the executor's per-id cache warms up. Do not trim — the branch is
+	// load-bearing for chunks that alternate dict/flat shape across row groups.
 	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		result.Initialize();
 	}
