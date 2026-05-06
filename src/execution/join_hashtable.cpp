@@ -878,9 +878,6 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 			scan_structure.sel_vector.set_index(kept++, row_index);
 		}
 	}
-	if (kept < prepared_count) {
-		scan_structure.has_null_value_filter = true;
-	}
 	scan_structure.count = kept;
 }
 

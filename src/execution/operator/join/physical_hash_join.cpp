@@ -1354,9 +1354,14 @@ public:
 	}
 };
 
-//! Structural gate for the ht_probe wrapper: single-equality joins on a column-reference LHS, in-memory only
+//! Structural gate for the ht_probe wrapper. All four predicates must hold for the operator to allocate the
+//! wrapped executor at all: in-memory hash table (not external), no perfect-hash join executor on the sink,
+//! exactly one equality condition (= or IS NOT DISTINCT FROM), and a plain column-reference LHS.
 static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
+		return false;
+	}
+	if (sink.perfect_join_executor) {
 		return false;
 	}
 	if (conditions.size() != 1) {
@@ -1375,7 +1380,8 @@ static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vec
 
 //! Per-chunk gate mirroring the dictionary-eligibility checks in TryExecuteDictionaryExpression. Skips the
 //! executor when its own gate would bail, so non-dictionary chunks pay no wrapper overhead. The chunk_fill_ratio
-//! gate is intentionally not mirrored: it would bypass cache-warm chunks for large dictionaries on narrow inputs.
+//! gate is intentionally not mirrored: the executor applies it only on first-encounter dictionary ids, and its
+//! cache state is invisible from here, so mirroring it would be over-conservative on every chunk after the first.
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1419,7 +1425,7 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 		sink.InitializeProbeSpill();
 	}
 
-	if (!sink.perfect_join_executor && CanUseHTProbeFunction(sink, conditions)) {
+	if (CanUseHTProbeFunction(sink, conditions)) {
 		// wrap the probe in an ExpressionExecutor so TryExecuteDictionaryExpression can fire on dictionary inputs
 		auto fun = HashJoinProbeScalarFun::GetFunction(condition_types[0]);
 		BoundScalarFunction bound_function(fun);
@@ -1487,7 +1493,6 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		} else if (state.ht_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
 			// only route through ht_probe when the dict fast path will fire; otherwise the wrapper pays
 			// executor dispatch and an O(N) reshape with no algorithmic win
-			state.ht_probe_arg_chunk.Reset();
 			state.ht_probe_arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
 			state.ht_probe_arg_chunk.SetCardinality(state.lhs_join_keys.size());
 			state.ht_probe_executor->ExecuteExpression(state.ht_probe_arg_chunk, state.ht_probe_pointers);
