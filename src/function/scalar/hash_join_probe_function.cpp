@@ -50,6 +50,7 @@ void HashJoinProbeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 	auto &local = ExecuteFunctionState::GetFunctionState(state)->Cast<HashJoinProbeLocalState>();
 	auto &expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &bind_data = expr.bind_info->Cast<HashJoinProbeFunctionData>();
+	D_ASSERT(bind_data.hash_table);
 	auto &ht = *bind_data.hash_table;
 
 	const idx_t count = args.size();

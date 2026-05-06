@@ -1339,9 +1339,11 @@ public:
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
 
-	//! Dictionary-aware probe machinery, only initialised when CanUseHTProbeFunction allows it
-	unique_ptr<ExpressionExecutor> ht_probe_executor;
+	//! Dictionary-aware probe machinery, only initialised when CanUseHTProbeFunction allows it.
+	//! ht_probe_expr is declared before ht_probe_executor so the executor is destroyed first; the
+	//! executor's ExpressionState holds a reference to the expression and would otherwise dangle.
 	unique_ptr<BoundFunctionExpression> ht_probe_expr;
+	unique_ptr<ExpressionExecutor> ht_probe_executor;
 	Vector ht_probe_pointers;
 	DataChunk ht_probe_arg_chunk;
 	bool ht_probe_enabled = false;
