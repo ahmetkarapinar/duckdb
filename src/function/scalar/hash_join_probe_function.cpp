@@ -55,8 +55,7 @@ void HashJoinProbeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 
 	const idx_t count = args.size();
 
-	// RowMatcher::Match inside GetRowPointers re-checks equality against the build keys, so it needs the
-	// input as a chunk laid out in unified format
+	// GetRowPointers' RowMatcher re-checks key equality against the build side, which reads through unified format
 	local.single_key_chunk.Reset();
 	local.single_key_chunk.data[0].Reference(args.data[0]);
 	local.single_key_chunk.SetCardinality(count);
@@ -64,22 +63,15 @@ void HashJoinProbeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 
 	VectorOperations::Hash(local.single_key_chunk.data[0], local.hashes, count);
 
-	// We are on the regular-callback path: TryExecuteDictionaryExpression bailed despite the operator's
-	// LHSChunkIsDictionaryEligible gate letting this chunk through (the executor's chunk_fill_ratio gate
-	// fires for first-encounter dictionary ids whose size is in [STANDARD_VECTOR_SIZE, 20000]). A prior
-	// dict-fast-path call may have swapped `result`'s buffer for a DictionaryBuffer that does not support
-	// SetVectorType, so re-allocate as a fresh flat buffer to keep FlatVector::ValidityMutable below valid.
-	// Cost: one STANDARD_VECTOR_SIZE * sizeof(data_ptr_t) allocation on the first non-dict chunk after a
-	// dict-fast-path call, paid until the executor's per-id cache warms up. Do not trim — the branch is
-	// load-bearing for chunks that alternate dict/flat shape across row groups.
+	// a prior dict-fast-path call may have swapped result's buffer for a DictionaryBuffer (no SetVectorType
+	// support); reallocate as a flat buffer so FlatVector::ValidityMutable below is valid
 	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		result.Initialize();
 	}
 	const idx_t hit_count = ht.LookupHeadPointers(local.single_key_chunk, local.key_state, local.probe_state,
 	                                              local.hashes, result, local.match_sel);
 
-	// LookupHeadPointers leaves miss slots holding the last salt-collision pointer it tried, so we cannot
-	// use "null pointer" as a miss marker; encode hit/miss in the validity mask instead
+	// miss slots may carry stale salt-collision pointers, so encode hit/miss in the validity mask
 	auto &validity = FlatVector::ValidityMutable(result);
 	validity.SetAllInvalid(count);
 	for (idx_t i = 0; i < hit_count; i++) {

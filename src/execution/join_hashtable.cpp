@@ -861,14 +861,13 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 	const SelectionVector *current_sel;
 	const idx_t prepared_count = PrepareScanStructure(scan_structure, keys, key_state, current_sel);
 
-	// pointers may be a DICTIONARY_VECTOR from the dict fast path; UnifiedVectorFormat avoids flattening N entries
+	// route through UnifiedVectorFormat so a DICTIONARY_VECTOR pointers input is read indirectly, not flattened
 	UnifiedVectorFormat ptr_format;
 	pointers.ToUnifiedFormat(keys.size(), ptr_format);
 	const auto src_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(ptr_format);
 	const auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
 
-	// hits/misses come from the validity mask set by HashJoinProbeFunction; drop misses to match the
-	// (pointers, sel_vector, count) shape produced by the direct Probe path
+	// miss slots may carry stale salt-collision pointers, so hit/miss is encoded in the validity mask
 	idx_t kept = 0;
 	for (idx_t i = 0; i < prepared_count; i++) {
 		const auto row_index = current_sel->get_index(i);

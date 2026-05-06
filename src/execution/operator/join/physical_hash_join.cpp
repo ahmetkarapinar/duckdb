@@ -1319,13 +1319,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
-//! Cluster of state needed by the dictionary-aware ht_probe wrapper. Allocated only when
-//! CanUseHTProbeFunction returns true, so non-eligible joins (multi-key, expression LHS, external,
-//! perfect-hash) pay no setup cost — including the STANDARD_VECTOR_SIZE * sizeof(data_ptr_t) buffer
-//! that pointers used to allocate unconditionally on the operator state. Member declaration order
-//! is load-bearing: ExpressionExecutor and its child ExpressionState objects keep raw pointers and
-//! references back into the expression, so expr is declared before executor to outlive it (members
-//! are destroyed in reverse declaration order).
+//! State for the ht_probe wrapper. Held by unique_ptr on HashJoinOperatorState so non-eligible joins
+//! pay no setup cost. expr must be declared before executor: the executor and its ExpressionState keep
+//! raw pointers/references into expr and must be destroyed first (reverse declaration order).
 class HTProbeState {
 public:
 	HTProbeState(ClientContext &context, Allocator &allocator, unique_ptr<BoundFunctionExpression> expr_p,
@@ -1360,8 +1356,7 @@ public:
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
 
-	//! Dictionary-aware probe wrapper, allocated only when CanUseHTProbeFunction returns true; null
-	//! otherwise so non-eligible joins remain bit-for-bit identical to today on setup and per chunk.
+	//! Dictionary-aware probe wrapper; only populated when CanUseHTProbeFunction holds
 	unique_ptr<HTProbeState> ht_probe;
 
 public:
@@ -1370,9 +1365,9 @@ public:
 	}
 };
 
-//! Structural gate for the ht_probe wrapper. All four predicates must hold for the operator to allocate the
-//! wrapped executor at all: in-memory hash table (not external), no perfect-hash join executor on the sink,
-//! exactly one equality condition (= or IS NOT DISTINCT FROM), and a plain column-reference LHS.
+//! Operator-level gate for the ht_probe wrapper: in-memory hash table, no perfect-hash executor, single
+//! equality condition (= or IS NOT DISTINCT FROM), column-ref LHS. Per-chunk shape gate is
+//! LHSChunkIsDictionaryEligible.
 static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
 		return false;
@@ -1394,10 +1389,8 @@ static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
-//! Per-chunk gate mirroring the dictionary-eligibility checks in TryExecuteDictionaryExpression. Skips the
-//! executor when its own gate would bail, so non-dictionary chunks pay no wrapper overhead. The chunk_fill_ratio
-//! gate is intentionally not mirrored: the executor applies it only on first-encounter dictionary ids, and its
-//! cache state is invisible from here, so mirroring it would be over-conservative on every chunk after the first.
+//! Per-chunk gate mirroring the dictionary-eligibility checks in TryExecuteDictionaryExpression. The
+//! chunk_fill_ratio gate is not mirrored: the executor's per-id cache state is invisible from here.
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1442,13 +1435,13 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 	}
 
 	if (CanUseHTProbeFunction(sink, conditions)) {
-		// wrap the probe in an ExpressionExecutor so TryExecuteDictionaryExpression can fire on dictionary inputs
+		// wrap the probe in an ExpressionExecutor so TryExecuteDictionaryExpression fires on dictionary inputs
 		auto fun = HashJoinProbeScalarFun::GetFunction(condition_types[0]);
 		BoundScalarFunction bound_function(fun);
 
 		auto bind_data = make_uniq<HashJoinProbeFunctionData>(sink.hash_table.get(), condition_types[0]);
 
-		// the BoundReferenceExpression resolves to HTProbeState::arg_chunk's only column (the LHS key)
+		// the BoundReferenceExpression resolves to HTProbeState::arg_chunk's only column
 		static constexpr idx_t HT_PROBE_KEY_COLUMN_INDEX = 0;
 		vector<unique_ptr<Expression>> children;
 		children.push_back(make_uniq<BoundReferenceExpression>(condition_types[0], HT_PROBE_KEY_COLUMN_INDEX));
@@ -1506,8 +1499,7 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
 		} else if (state.ht_probe && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
-			// only route through ht_probe when the dict fast path will fire; otherwise the wrapper pays
-			// executor dispatch and an O(N) reshape with no algorithmic win
+			// only route through ht_probe when the dict fast path will fire; otherwise the wrapper is pure overhead
 			auto &probe = *state.ht_probe;
 			probe.arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
 			probe.arg_chunk.SetCardinality(state.lhs_join_keys.size());
