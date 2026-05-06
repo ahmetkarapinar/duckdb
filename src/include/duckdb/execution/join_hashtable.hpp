@@ -221,10 +221,11 @@ public:
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
-	//! Public façade for the templated GetRowPointers
-	void ProbeKeysToHeadPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
-	                             const SelectionVector *sel, idx_t &count, Vector &pointers_result_v,
-	                             SelectionVector &match_sel, bool has_sel);
+	//! Look up the head-of-chain pointer for each key in `keys`. Hits are written to `result_pointers` at
+	//! the matched row index and recorded in `match_sel`; misses are not written. Caller owns the per-thread
+	//! `key_state`, `state` and `hashes` scratch buffers. Returns the number of hits (<= keys.size()).
+	idx_t LookupHeadPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes,
+	                         Vector &result_pointers, SelectionVector &match_sel);
 	//! Build a ScanStructure from an already-resolved head-pointer vector; misses are encoded as invalid in the
 	//! pointer vector's validity mask
 	void InitializeScanStructureFromPointers(ScanStructure &scan_structure, DataChunk &keys,
@@ -385,6 +386,11 @@ public:
 private:
 	void InitializeScanStructure(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
 	                             const SelectionVector *&current_sel);
+	//! Shared prelude for InitializeScanStructure and InitializeScanStructureFromPointers: prepares the
+	//! scan-structure flags, lays out keys in unified format, NULL-filters into scan_structure.sel_vector
+	//! and sets has_null_value_filter. Returns the number of rows that survived NULL filtering.
+	idx_t PrepareScanStructure(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
+	                           const SelectionVector *&current_sel);
 	void Hash(DataChunk &keys, const SelectionVector &sel, idx_t count, Vector &hashes);
 
 	bool UseSalt() const;
