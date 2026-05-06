@@ -221,13 +221,12 @@ public:
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
-	//! Public façade for the templated GetRowPointers; lets external code (e.g. the ht_probe scalar function
-	//! callback) resolve head-of-chain pointers without exposing the templated internals.
+	//! Public façade for the templated GetRowPointers
 	void ProbeKeysToHeadPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes_v,
 	                             const SelectionVector *sel, idx_t &count, Vector &pointers_result_v,
 	                             SelectionVector &match_sel, bool has_sel);
-	//! Build a ScanStructure from an already-resolved head-pointer vector. Misses are signalled by a null
-	//! pointer at the corresponding row index.
+	//! Build a ScanStructure from an already-resolved head-pointer vector; misses are encoded as invalid in the
+	//! pointer vector's validity mask
 	void InitializeScanStructureFromPointers(ScanStructure &scan_structure, DataChunk &keys,
 	                                         TupleDataChunkState &key_state, Vector &pointers);
 	//! Scan the HT to construct the full outer join result

@@ -857,7 +857,7 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 	D_ASSERT(finalized);
 	D_ASSERT(Count() > 0);
 
-	// mirror InitializeScanStructure up to (but not including) the GetRowPointers call
+	// mirrors InitializeScanStructure up to the GetRowPointers call
 	scan_structure.is_null = false;
 	scan_structure.finished = false;
 	if (join_type != JoinType::INNER) {
@@ -871,15 +871,14 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
 	scan_structure.has_null_value_filter = prepared_count < keys.size();
 
-	// pointers may arrive as a DICTIONARY_VECTOR from the dict fast path; route through UnifiedVectorFormat so
-	// the dict's selection vector and validity mask are honoured without a flat materialisation
+	// pointers may be a DICTIONARY_VECTOR from the dict fast path; UnifiedVectorFormat avoids flattening N entries
 	UnifiedVectorFormat ptr_format;
 	pointers.ToUnifiedFormat(keys.size(), ptr_format);
 	const auto src_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(ptr_format);
 	const auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
 
-	// hits and misses are encoded in the validity mask (set by HashJoinProbeFunction); drop misses so the chain
-	// walker sees the same (pointers, sel_vector, count) shape that GetRowPointers produces in the direct path
+	// hits/misses come from the validity mask set by HashJoinProbeFunction; drop misses to match the
+	// (pointers, sel_vector, count) shape produced by the direct Probe path
 	idx_t kept = 0;
 	for (idx_t i = 0; i < prepared_count; i++) {
 		const auto row_index = current_sel->get_index(i);

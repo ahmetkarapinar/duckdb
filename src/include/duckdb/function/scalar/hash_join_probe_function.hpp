@@ -17,7 +17,7 @@ namespace duckdb {
 
 class JoinHashTable;
 
-//! Carries a non-owning pointer to a finalised JoinHashTable into the ht_probe scalar-function callback.
+//! Bind data carrying a non-owning pointer to the finalised JoinHashTable that ht_probe reads from
 struct HashJoinProbeFunctionData : public FunctionData {
 	HashJoinProbeFunctionData(optional_ptr<JoinHashTable> hash_table, LogicalType key_type);
 
@@ -31,8 +31,7 @@ struct HashJoinProbeFunctionData : public FunctionData {
 struct HashJoinProbeScalarFun {
 	static constexpr const char *NAME = "ht_probe";
 
-	//! Build a ScalarFunction that resolves head-of-chain pointers in the bound JoinHashTable.
-	//! Constructed locally in PhysicalHashJoin::GetOperatorState; not registered in the catalog.
+	//! Build a ScalarFunction that probes the bound JoinHashTable; not registered in the catalog
 	static ScalarFunction GetFunction(const LogicalType &input_type);
 };
 

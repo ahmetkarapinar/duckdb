@@ -1339,7 +1339,7 @@ public:
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
 
-	//! Dictionary-aware probe machinery; only initialised when CanUseHTProbeFunction returns true
+	//! Dictionary-aware probe machinery, only initialised when CanUseHTProbeFunction allows it
 	unique_ptr<ExpressionExecutor> ht_probe_executor;
 	unique_ptr<BoundFunctionExpression> ht_probe_expr;
 	Vector ht_probe_pointers;
@@ -1352,8 +1352,7 @@ public:
 	}
 };
 
-//! Whether the dict-aware probe wrapper applies to this operator. Limited to single-equality joins on a column
-//! reference LHS over an in-memory hash table, mirroring the project's supervisor-imposed scope.
+//! Structural gate for the ht_probe wrapper: single-equality joins on a column-reference LHS, in-memory only
 static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
 		return false;
@@ -1372,13 +1371,9 @@ static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
-//! Per-chunk gate that mirrors the unconditional dictionary-eligibility checks inside
-//! ExecuteFunctionState::TryExecuteDictionaryExpression (execute_function.cpp:60-73). When this returns false,
-//! routing through the wrapped ht_probe executor would still bail at the executor's own gate and fall through
-//! to per-row execution, paying executor overhead for no win - so we route directly to JoinHashTable::Probe
-//! instead. The chunk_fill_ratio gate (execute_function.cpp:77-83) is intentionally not mirrored here: it only
-//! applies on first-encounter dictionary ids and the executor's own cache state is invisible from this caller,
-//! so applying it would bypass cache-warm chunks for large dictionaries on narrow inputs.
+//! Per-chunk gate mirroring the dictionary-eligibility checks in TryExecuteDictionaryExpression. Skips the
+//! executor when its own gate would bail, so non-dictionary chunks pay no wrapper overhead. The chunk_fill_ratio
+//! gate is intentionally not mirrored: it would bypass cache-warm chunks for large dictionaries on narrow inputs.
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1423,8 +1418,7 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 	}
 
 	if (!sink.perfect_join_executor && CanUseHTProbeFunction(sink, conditions)) {
-		// build a single-expression executor over ht_probe(key) so the dict fast path inside
-		// TryExecuteDictionaryExpression can fire automatically when the LHS arrives as a storage dictionary
+		// wrap the probe in an ExpressionExecutor so TryExecuteDictionaryExpression can fire on dictionary inputs
 		auto fun = HashJoinProbeScalarFun::GetFunction(condition_types[0]);
 		BoundScalarFunction bound_function(fun);
 
@@ -1489,9 +1483,8 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
 		} else if (state.ht_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
-			// route the probe through ht_probe(key) only when the LHS chunk would actually take the executor's
-			// dictionary fast path; on flat or non-storage-dictionary chunks the wrapper would otherwise pay an
-			// executor dispatch and an O(N) validity-mask reshape for no algorithmic win
+			// only route through ht_probe when the dict fast path will fire; otherwise the wrapper pays
+			// executor dispatch and an O(N) reshape with no algorithmic win
 			state.ht_probe_arg_chunk.Reset();
 			state.ht_probe_arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
 			state.ht_probe_arg_chunk.SetCardinality(state.lhs_join_keys.size());
