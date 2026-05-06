@@ -3,6 +3,7 @@
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/projection_index.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/uhugeint.hpp"
@@ -1371,6 +1372,31 @@ static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
+//! Per-chunk gate that mirrors the unconditional dictionary-eligibility checks inside
+//! ExecuteFunctionState::TryExecuteDictionaryExpression (execute_function.cpp:60-73). When this returns false,
+//! routing through the wrapped ht_probe executor would still bail at the executor's own gate and fall through
+//! to per-row execution, paying executor overhead for no win - so we route directly to JoinHashTable::Probe
+//! instead. The chunk_fill_ratio gate (execute_function.cpp:77-83) is intentionally not mirrored here: it only
+//! applies on first-encounter dictionary ids and the executor's own cache state is invisible from this caller,
+//! so applying it would bypass cache-warm chunks for large dictionaries on narrow inputs.
+static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
+	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+		return false;
+	}
+	const auto size_opt = DictionaryVector::DictionarySize(lhs_key);
+	if (!size_opt.IsValid()) {
+		return false;
+	}
+	if (DictionaryVector::DictionaryId(lhs_key).empty()) {
+		return false;
+	}
+	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
+	if (size_opt.GetIndex() >= MAX_DICTIONARY_SIZE_THRESHOLD) {
+		return false;
+	}
+	return true;
+}
+
 unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &context) const {
 	auto &allocator = BufferAllocator::Get(context.client);
 	auto &sink = sink_state->Cast<HashJoinGlobalSinkState>();
@@ -1462,9 +1488,10 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
-		} else if (state.ht_probe_enabled) {
-			// route the probe through ht_probe(key); if the LHS is a storage dictionary the executor's generic
-			// fast path runs the function on D distinct codes (and reuses the cached output across batches)
+		} else if (state.ht_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
+			// route the probe through ht_probe(key) only when the LHS chunk would actually take the executor's
+			// dictionary fast path; on flat or non-storage-dictionary chunks the wrapper would otherwise pay an
+			// executor dispatch and an O(N) validity-mask reshape for no algorithmic win
 			state.ht_probe_arg_chunk.Reset();
 			state.ht_probe_arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
 			state.ht_probe_arg_chunk.SetCardinality(state.lhs_join_keys.size());
