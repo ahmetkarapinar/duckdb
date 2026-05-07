@@ -3,6 +3,7 @@
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/projection_index.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/uhugeint.hpp"
@@ -1575,6 +1576,41 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
+//! Once-per-operator-state structural gate for the dictionary-aware probe path. Mirrors the analogous gate
+//! the aggregate side imposes via groups.ColumnCount() == 1 at aggregate_hashtable.cpp:521-523.
+static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
+	if (sink.external) {
+		// external joins re-finalise the HT mid-probe; the per-id cache would point at stale build pointers
+		return false;
+	}
+	if (sink.perfect_join_executor) {
+		return false;
+	}
+	if (conditions.size() != 1) {
+		return false;
+	}
+	const auto cmp = conditions[0].GetComparisonType();
+	if (cmp != ExpressionType::COMPARE_EQUAL && cmp != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return false;
+	}
+	if (conditions[0].GetLHS().GetExpressionClass() != ExpressionClass::BOUND_REF) {
+		return false;
+	}
+	if (conditions[0].GetLHS().GetReturnType().InternalType() == PhysicalType::STRUCT) {
+		return false;
+	}
+	return true;
+}
+
+//! Per-chunk fast-reject. The source-of-truth checks (dict id, dict size) live inside TryProbeDictionary;
+//! this gate just avoids entering the wrapper for flat / non-storage-dict inputs.
+static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
+	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+		return false;
+	}
+	return DictionaryVector::DictionarySize(lhs_key).IsValid();
+}
+
 class HashJoinOperatorState : public CachingOperatorState {
 public:
 	HashJoinOperatorState(ClientContext &context, const PhysicalHashJoin &op_p, HashJoinGlobalSinkState &sink)
@@ -1594,6 +1630,8 @@ public:
 	JoinHashTable::ProbeState probe_state;
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
+	//! True iff CanUseDictionaryProbe holds for this operator; checked once in GetOperatorState
+	bool dict_probe_enabled = false;
 
 public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
@@ -1647,6 +1685,8 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 		sink.InitializeProbeSpill();
 	}
 
+	state->dict_probe_enabled = CanUseDictionaryProbe(sink, conditions);
+
 	return std::move(state);
 }
 
@@ -1698,6 +1738,10 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
+		} else if (state.dict_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
+		           sink.hash_table->TryProbeDictionary(state.scan_structure, state.lhs_join_keys, state.join_key_state,
+		                                               state.probe_state)) {
+			// dictionary-aware fast path produced the scan_structure; nothing else to do
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}
