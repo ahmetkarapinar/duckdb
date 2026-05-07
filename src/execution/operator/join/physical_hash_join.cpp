@@ -1576,11 +1576,10 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
-//! Once-per-operator-state structural gate for the dictionary-aware probe path. Mirrors the analogous gate
-//! the aggregate side imposes via groups.ColumnCount() == 1 at aggregate_hashtable.cpp:521-523.
+//! Structural gate for the dictionary-aware probe path; checked once per operator state.
 static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
-		// external joins re-finalise the HT mid-probe; the per-id cache would point at stale build pointers
+		// external joins re-finalise the HT mid-probe, which would invalidate the per-id pointer cache
 		return false;
 	}
 	if (sink.perfect_join_executor) {
@@ -1602,8 +1601,7 @@ static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
-//! Per-chunk fast-reject. The source-of-truth checks (dict id, dict size) live inside TryProbeDictionary;
-//! this gate just avoids entering the wrapper for flat / non-storage-dict inputs.
+//! Per-chunk fast-reject; the source-of-truth checks live inside TryProbeDictionary
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1630,7 +1628,7 @@ public:
 	JoinHashTable::ProbeState probe_state;
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
-	//! True iff CanUseDictionaryProbe holds for this operator; checked once in GetOperatorState
+	//! Whether the dictionary-aware probe path may be used for this operator
 	bool dict_probe_enabled = false;
 
 public:
@@ -1741,7 +1739,7 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		} else if (state.dict_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
 		           sink.hash_table->TryProbeDictionary(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 		                                               state.probe_state)) {
-			// dictionary-aware fast path produced the scan_structure; nothing else to do
+			// dictionary-aware fast path populated scan_structure
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}

@@ -899,8 +899,7 @@ void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleD
 
 bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
                                        ProbeState &probe_state) {
-	// Direct port of GroupedAggregateHashTable::TryAddDictionaryGroups (aggregate_hashtable.cpp).
-	// Single-key scope is enforced by the caller (see CanUseDictionaryProbe in physical_hash_join.cpp).
+	// port of GroupedAggregateHashTable::TryAddDictionaryGroups; single-key scope is enforced by the caller
 	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
 	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
 
@@ -908,19 +907,19 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	D_ASSERT(Count() > 0);
 	D_ASSERT(finalized);
 
-	// eligibility: storage-shaped dictionary only
 	auto &dict_col = keys.data[0];
 	if (dict_col.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
 	}
 	const auto opt_dict_size = DictionaryVector::DictionarySize(dict_col);
 	if (!opt_dict_size.IsValid()) {
+		// dict size not known - this is not a dictionary that comes from the storage
 		return false;
 	}
 	const idx_t dict_size = opt_dict_size.GetIndex();
 	const auto &dictionary_id = DictionaryVector::DictionaryId(dict_col);
 	if (dictionary_id.empty()) {
-		// no id -> we cannot cache across vectors; only worth it if the dict is much smaller than the chunk
+		// no id, can't cache across vectors - only worth it if the dictionary is much smaller than the chunk
 		if (dict_size * DICTIONARY_THRESHOLD >= keys.size()) {
 			return false;
 		}
@@ -932,8 +931,8 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	auto &offsets = DictionaryVector::SelVector(dict_col);
 	auto &dict_state = probe_state.dict_state;
 
-	// bind / re-bind per-id cache
 	if (dict_state.dictionary_id.empty() || dict_state.dictionary_id != dictionary_id) {
+		// new dictionary - initialize the per-id cache
 		if (dict_size > dict_state.capacity) {
 			dict_state.dictionary_pointers = make_uniq<Vector>(LogicalType::POINTER, dict_size);
 			dict_state.dictionary_validity = make_unsafe_uniq_array<bool>(dict_size);
@@ -941,7 +940,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			dict_state.capacity = dict_size;
 		}
 		memset(dict_state.found_entry.get(), 0, dict_size * sizeof(bool));
-		// Validity is keyed by dict slot and persists across chunks, so it is only zeroed when the id rotates
+		// validity persists across chunks under the same id, so it is only zeroed when the id rotates
 		memset(dict_state.dictionary_validity.get(), 0, dict_size * sizeof(bool));
 		dict_state.dictionary_id = dictionary_id;
 	} else if (dict_size > dict_state.capacity) {
@@ -950,7 +949,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		                        dict_state.dictionary_id, dict_size, dict_state.capacity);
 	}
 
-	// walk N rows once to find dict slots that have not been resolved yet for this id
+	// for each row, mark its dict slot in found_entry and append to unique_entries the first time we see it
 	auto &found_entry = dict_state.found_entry;
 	auto &unique_entries = dict_state.unique_entries;
 	idx_t unique_count = 0;
@@ -962,16 +961,15 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	}
 
 	if (unique_count > 0) {
-		// slice + hash + probe on the D unique slots
 		auto &unique_values = dict_state.unique_values;
 		if (unique_values.ColumnCount() == 0) {
 			unique_values.InitializeEmpty(vector<LogicalType> {equality_types[0]});
 			TupleDataCollection::InitializeChunkState(dict_state.unique_key_state, {equality_types[0]});
 		}
+		// slice the dictionary down to the unique entries, then hash and probe
 		unique_values.data[0].Slice(dictionary_vector, unique_entries, unique_count);
 		unique_values.SetCardinality(unique_count);
 
-		// lay out the keys for the byte-equality re-check inside RowMatcher::Match (called by GetRowPointers)
 		TupleDataCollection::ToUnifiedFormat(dict_state.unique_key_state, unique_values);
 
 		auto &hashes = dict_state.hashes;
@@ -981,9 +979,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
 		               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
 
-		// remap position-indexed hits onto the per-slot cache via unique_entries; misses keep their
-		// previous validity bit (false at re-bind, possibly true if cached from a prior chunk under
-		// the same id — though that should never happen because unique_entries only holds new slots).
+		// remap position-indexed hits onto the per-slot cache via unique_entries
 		const auto src_ptrs = FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers);
 		auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers);
 		for (idx_t i = 0; i < count; i++) {
@@ -993,9 +989,8 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			dict_state.dictionary_validity[dict_idx] = true;
 		}
 	}
-	// when unique_count == 0 the cache is fully warm and dictionary_validity / dictionary_pointers are still valid
 
-	// fan out: produce the same scan_structure shape that InitializeScanStructure + GetRowPointers produce in Probe()
+	// fan out: emit the scan_structure shape that Probe() produces via InitializeScanStructure + GetRowPointers
 	scan_structure.is_null = false;
 	scan_structure.finished = false;
 	if (join_type != JoinType::INNER) {
