@@ -1,0 +1,280 @@
+# name: test/sql/join/hash_join/hash_join_dictionary_probe.test
+# description: Test the dictionary-aware ht_probe optimization on hash-join probes.
+#              Activation requires a single-equality join with a column-ref LHS, an
+#              in-memory hash table (non-perfect-hash), and an LHS chunk arriving as
+#              a storage DICTIONARY_VECTOR with a non-empty dictionary id and size
+#              <= STANDARD_VECTOR_SIZE. The activation tests scan from a checkpointed
+#              VARCHAR column so the storage layer emits DICTIONARY_VECTOR chunks;
+#              the fallback tests deliberately violate one structural or per-chunk
+#              condition so the wrapper is bypassed and the existing Probe() path runs.
+# group: [hash_join]
+
+statement ok
+PRAGMA enable_verification
+
+statement ok
+ATTACH '{TEST_DIR}/hash_join_dictionary_probe.db' AS d
+
+statement ok
+USE d
+
+#
+# ---------------------------------------------------------------------------
+# Section A — activation paths (ht_probe fires)
+# ---------------------------------------------------------------------------
+#
+
+statement ok
+CREATE TABLE probe AS
+SELECT i AS id, ('K' || (((i % 5) + 1)::VARCHAR)) AS k
+FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE build (k VARCHAR, name VARCHAR)
+
+statement ok
+INSERT INTO build VALUES
+    ('K1', 'one'),
+    ('K2', 'two'),
+    ('K3', 'three'),
+    ('K4', 'four'),
+    ('K5', 'five')
+
+# A1. inner join, every probe row matches
+query II
+SELECT b.name, COUNT(*) FROM probe p JOIN build b ON p.k = b.k
+GROUP BY b.name ORDER BY b.name
+----
+five	1000
+four	1000
+one	1000
+three	1000
+two	1000
+
+# A2. left join with two unmatched probe rows
+statement ok
+CREATE TABLE probe_with_misses AS
+SELECT id, k FROM probe
+UNION ALL
+SELECT 100000 + i, 'KX' FROM range(2) t(i)
+
+statement ok
+CHECKPOINT
+
+query II
+SELECT COALESCE(b.name, 'NO_MATCH') AS name, COUNT(*) AS cnt
+FROM probe_with_misses p LEFT JOIN build b ON p.k = b.k
+GROUP BY 1 ORDER BY name
+----
+NO_MATCH	2
+five	1000
+four	1000
+one	1000
+three	1000
+two	1000
+
+# A3. right join with an orphan build row
+statement ok
+CREATE TABLE build_with_orphan AS SELECT * FROM build
+
+statement ok
+INSERT INTO build_with_orphan VALUES ('KZ', 'orphan')
+
+query II
+SELECT b.name, COUNT(p.id)
+FROM probe p RIGHT JOIN build_with_orphan b ON p.k = b.k
+GROUP BY b.name ORDER BY b.name
+----
+five	1000
+four	1000
+one	1000
+orphan	0
+three	1000
+two	1000
+
+# A4. full outer join — unmatched rows on both sides
+query II
+SELECT COALESCE(b.name, 'NO_MATCH') AS name, COUNT(*) AS cnt
+FROM probe_with_misses p FULL OUTER JOIN build_with_orphan b ON p.k = b.k
+GROUP BY 1 ORDER BY name
+----
+NO_MATCH	2
+five	1000
+four	1000
+one	1000
+orphan	1
+three	1000
+two	1000
+
+# A5. semi join — every probe row has a match
+query I
+SELECT COUNT(*) FROM probe p WHERE p.k IN (SELECT k FROM build)
+----
+5000
+
+# A6. anti join — only the two synthetic misses survive
+query I
+SELECT COUNT(*) FROM probe_with_misses p
+WHERE p.k NOT IN (SELECT k FROM build WHERE k IS NOT NULL)
+----
+2
+
+# A7. IS NOT DISTINCT FROM — accepted by CanUseHTProbeFunction
+query I
+SELECT COUNT(*) FROM probe p JOIN build b ON p.k IS NOT DISTINCT FROM b.k
+----
+5000
+
+# A8. join key narrower than the underlying scan — column-ref LHS is preserved
+query II
+SELECT b.name, COUNT(*) FROM probe p JOIN build b ON p.k = b.k
+WHERE p.id < 100 GROUP BY b.name ORDER BY b.name
+----
+five	20
+four	20
+one	20
+three	20
+two	20
+
+#
+# ---------------------------------------------------------------------------
+# Section B — fallback paths (ht_probe must NOT fire)
+# ---------------------------------------------------------------------------
+#
+
+# B1. multi-key join — CanUseHTProbeFunction rejects (conditions.size() != 1).
+statement ok
+CREATE TABLE probe_mk AS
+SELECT i AS id,
+       ('K' || (((i % 5) + 1)::VARCHAR)) AS k,
+       ('B' || (((i % 3) + 1)::VARCHAR)) AS k2
+FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE build_mk (k VARCHAR, k2 VARCHAR)
+
+statement ok
+INSERT INTO build_mk VALUES ('K1', 'B1'), ('K2', 'B2'), ('K3', 'B3')
+
+query I
+SELECT COUNT(*) FROM probe_mk p JOIN build_mk b ON p.k = b.k AND p.k2 = b.k2
+----
+1002
+
+# B2. expression LHS — CanUseHTProbeFunction rejects (LHS not a BOUND_REF).
+query I
+SELECT COUNT(*) FROM probe p JOIN build b ON (p.k || '') = b.k
+----
+5000
+
+# B3. probe input is a constant/in-memory VALUES list — structural gate
+#     allows it through, but the per-chunk LHSChunkIsDictionaryEligible
+#     refuses because no storage dictionary is attached.
+query I
+SELECT COUNT(*) FROM (VALUES ('K1'), ('K2'), ('K3'), ('K1'), ('KX')) v(k)
+JOIN build b ON v.k = b.k
+----
+4
+
+# B4. INTEGER probe with a sparse build — integer scans don't emit
+#     DICTIONARY_VECTOR (storage uses bitpacking for integers) so the
+#     per-chunk gate refuses. The build range is wide enough that the
+#     perfect-hash executor is disabled too, so the normal probe path
+#     is reached, then falls through to direct Probe().
+statement ok
+CREATE TABLE int_probe AS
+SELECT (i * 100000)::BIGINT AS k FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE int_build (k BIGINT)
+
+statement ok
+INSERT INTO int_build VALUES (0), (100000), (200000), (300000), (400000),
+    (999999000000)
+
+query I
+SELECT COUNT(*) FROM int_probe p JOIN int_build b ON p.k = b.k
+----
+5
+
+# B5. perfect-hash join — small integer build with stats fitting the
+#     perfect-hash range bypasses the regular probe entirely, so
+#     CanUseHTProbeFunction (which excludes sink.perfect_join_executor)
+#     never even constructs the wrapper.
+statement ok
+CREATE TABLE ph_probe AS SELECT (i % 7)::INTEGER AS k FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE ph_build (k INTEGER, name VARCHAR)
+
+statement ok
+INSERT INTO ph_build VALUES
+    (0, 'zero'), (1, 'one'), (2, 'two'), (3, 'three'),
+    (4, 'four'), (5, 'five'), (6, 'six')
+
+query II
+SELECT b.name, COUNT(*) FROM ph_probe p JOIN ph_build b ON p.k = b.k
+GROUP BY b.name ORDER BY b.name
+----
+five	714
+four	714
+one	715
+six	714
+three	714
+two	714
+zero	715
+
+# B6. dictionary larger than STANDARD_VECTOR_SIZE — per-chunk gate
+#     refuses because the executor's chunk_fill_ratio can bail on
+#     cache-miss chunks and leave the operator paying the O(N) fan-out
+#     as pure overhead. The build still has every key, so correctness
+#     is unchanged when the direct Probe() path runs instead.
+statement ok
+CREATE TABLE wide_probe AS
+SELECT i AS id, ('W' || ((i % 4096)::VARCHAR)) AS k
+FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE wide_build AS SELECT 'W' || (i::VARCHAR) AS k FROM range(4096) t(i)
+
+query I
+SELECT COUNT(*) FROM wide_probe p JOIN wide_build b ON p.k = b.k
+----
+5000
+
+#
+# ---------------------------------------------------------------------------
+# Section C — interaction with the cross-chunk dictionary cache
+# ---------------------------------------------------------------------------
+#
+
+# C1. multiple chunks share one dictionary id — repeated chunks should
+#     short-circuit through ExecuteFunctionState's per-id cache. We can
+#     only observe correctness from SQL; the cache hit is verified
+#     externally via the std::cerr instrumentation while developing.
+query I
+SELECT COUNT(*) FROM probe p JOIN build b ON p.k = b.k
+----
+5000
+
+# C2. probing a checkpointed column twice in one statement is allowed.
+query I
+SELECT (SELECT COUNT(*) FROM probe p1 JOIN build b1 ON p1.k = b1.k)
+     + (SELECT COUNT(*) FROM probe p2 JOIN build b2 ON p2.k = b2.k)
+----
+10000
