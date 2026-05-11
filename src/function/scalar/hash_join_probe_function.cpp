@@ -56,7 +56,6 @@ void HashJoinProbeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 	const idx_t count = args.size();
 
 	// GetRowPointers' RowMatcher re-checks key equality against the build side, which reads through unified format
-	local.single_key_chunk.Reset();
 	local.single_key_chunk.data[0].Reference(args.data[0]);
 	local.single_key_chunk.SetCardinality(count);
 	TupleDataCollection::ToUnifiedFormat(local.key_state, local.single_key_chunk);

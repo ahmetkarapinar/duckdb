@@ -1389,8 +1389,11 @@ static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
-//! Per-chunk gate mirroring the dictionary-eligibility checks in TryExecuteDictionaryExpression. The
-//! chunk_fill_ratio gate is not mirrored: the executor's per-id cache state is invisible from here.
+//! Per-chunk gate mirroring the dictionary-eligibility checks in TryExecuteDictionaryExpression. We also
+//! refuse dict_size > STANDARD_VECTOR_SIZE: on those chunks the executor's chunk_fill_ratio gate can bail
+//! on cache-miss inputs and fall through to the regular callback that hashes/probes/re-checks all N rows,
+//! leaving the operator paying the O(N) fan-out in InitializeScanStructureFromPointers as pure overhead.
+//! Cache state is invisible from the caller, so we cannot tell hit from miss — refuse the whole class.
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1402,8 +1405,7 @@ static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (DictionaryVector::DictionaryId(lhs_key).empty()) {
 		return false;
 	}
-	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
-	if (size_opt.GetIndex() >= MAX_DICTIONARY_SIZE_THRESHOLD) {
+	if (size_opt.GetIndex() > STANDARD_VECTOR_SIZE) {
 		return false;
 	}
 	return true;

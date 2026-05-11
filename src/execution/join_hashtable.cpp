@@ -863,18 +863,41 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 
 	// route through UnifiedVectorFormat so a DICTIONARY_VECTOR pointers input is read indirectly, not flattened
 	UnifiedVectorFormat ptr_format;
-	pointers.ToUnifiedFormat(keys.size(), ptr_format);
+	pointers.ToUnifiedFormat(ptr_format);
 	const auto src_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(ptr_format);
 	const auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
 
 	// miss slots may carry stale salt-collision pointers, so hit/miss is encoded in the validity mask
+	if (!scan_structure.has_null_value_filter && ptr_format.validity.CannotHaveNull()) {
+		// fast path: no NULL keys were filtered (so current_sel is the incremental identity) and every
+		// probe is a hit, so the inner per-row validity probe and the kept counter are dead work
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto src_idx = ptr_format.sel->get_index(i);
+			dst_ptrs[i] = src_ptrs[src_idx];
+			scan_structure.sel_vector.set_index(i, i);
+		}
+		scan_structure.count = prepared_count;
+		return;
+	}
+
 	idx_t kept = 0;
-	for (idx_t i = 0; i < prepared_count; i++) {
-		const auto row_index = current_sel->get_index(i);
-		const auto src_idx = ptr_format.sel->get_index(row_index);
-		if (ptr_format.validity.RowIsValid(src_idx)) {
-			dst_ptrs[row_index] = src_ptrs[src_idx];
-			scan_structure.sel_vector.set_index(kept++, row_index);
+	if (scan_structure.has_null_value_filter) {
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto row_index = current_sel->get_index(i);
+			const auto src_idx = ptr_format.sel->get_index(row_index);
+			if (ptr_format.validity.RowIsValid(src_idx)) {
+				dst_ptrs[row_index] = src_ptrs[src_idx];
+				scan_structure.sel_vector.set_index(kept++, row_index);
+			}
+		}
+	} else {
+		// current_sel is the incremental identity, so row_index == i
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto src_idx = ptr_format.sel->get_index(i);
+			if (ptr_format.validity.RowIsValid(src_idx)) {
+				dst_ptrs[i] = src_ptrs[src_idx];
+				scan_structure.sel_vector.set_index(kept++, i);
+			}
 		}
 	}
 	scan_structure.count = kept;
