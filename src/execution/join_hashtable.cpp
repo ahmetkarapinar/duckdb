@@ -861,16 +861,15 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 	const SelectionVector *current_sel;
 	const idx_t prepared_count = PrepareScanStructure(scan_structure, keys, key_state, current_sel);
 
-	// route through UnifiedVectorFormat so a DICTIONARY_VECTOR pointers input is read indirectly, not flattened
+	// read through unified format so a DICTIONARY_VECTOR pointers input is not flattened
 	UnifiedVectorFormat ptr_format;
 	pointers.ToUnifiedFormat(ptr_format);
 	const auto src_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(ptr_format);
 	const auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
 
-	// miss slots may carry stale salt-collision pointers, so hit/miss is encoded in the validity mask
+	// hit/miss is encoded in validity: miss slots may carry stale salt-collision pointers
 	if (!scan_structure.has_null_value_filter && ptr_format.validity.CannotHaveNull()) {
-		// fast path: no NULL keys were filtered (so current_sel is the incremental identity) and every
-		// probe is a hit, so the inner per-row validity probe and the kept counter are dead work
+		// fast path: identity sel and every probe hits
 		for (idx_t i = 0; i < prepared_count; i++) {
 			const auto src_idx = ptr_format.sel->get_index(i);
 			dst_ptrs[i] = src_ptrs[src_idx];
@@ -891,7 +890,7 @@ void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_stru
 			}
 		}
 	} else {
-		// current_sel is the incremental identity, so row_index == i
+		// no NULL filter: current_sel is the identity, so row_index == i
 		for (idx_t i = 0; i < prepared_count; i++) {
 			const auto src_idx = ptr_format.sel->get_index(i);
 			if (ptr_format.validity.RowIsValid(src_idx)) {

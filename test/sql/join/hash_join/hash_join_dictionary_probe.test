@@ -1,12 +1,5 @@
 # name: test/sql/join/hash_join/hash_join_dictionary_probe.test
-# description: Test the dictionary-aware ht_probe optimization on hash-join probes.
-#              Activation requires a single-equality join with a column-ref LHS, an
-#              in-memory hash table (non-perfect-hash), and an LHS chunk arriving as
-#              a storage DICTIONARY_VECTOR with a non-empty dictionary id and size
-#              <= STANDARD_VECTOR_SIZE. The activation tests scan from a checkpointed
-#              VARCHAR column so the storage layer emits DICTIONARY_VECTOR chunks;
-#              the fallback tests deliberately violate one structural or per-chunk
-#              condition so the wrapper is bypassed and the existing Probe() path runs.
+# description: Test the dictionary-aware ht_probe optimization on hash-join probes
 # group: [hash_join]
 
 statement ok
@@ -18,11 +11,8 @@ ATTACH '{TEST_DIR}/hash_join_dictionary_probe.db' AS d
 statement ok
 USE d
 
-#
-# ---------------------------------------------------------------------------
-# Section A — activation paths (ht_probe fires)
-# ---------------------------------------------------------------------------
-#
+# Section A: activation paths — ht_probe fires.
+# Probe scans a checkpointed VARCHAR column so storage emits DICTIONARY_VECTOR chunks.
 
 statement ok
 CREATE TABLE probe AS
@@ -122,7 +112,7 @@ WHERE p.k NOT IN (SELECT k FROM build WHERE k IS NOT NULL)
 ----
 2
 
-# A7. IS NOT DISTINCT FROM — accepted by CanUseHTProbeFunction
+# A7. IS NOT DISTINCT FROM is accepted by the operator gate
 query I
 SELECT COUNT(*) FROM probe p JOIN build b ON p.k IS NOT DISTINCT FROM b.k
 ----
@@ -139,13 +129,10 @@ one	20
 three	20
 two	20
 
-#
-# ---------------------------------------------------------------------------
-# Section B — fallback paths (ht_probe must NOT fire)
-# ---------------------------------------------------------------------------
-#
+# Section B: fallback paths — ht_probe must NOT fire.
+# Each case deliberately violates one structural or per-chunk gate so the regular Probe() path runs.
 
-# B1. multi-key join — CanUseHTProbeFunction rejects (conditions.size() != 1).
+# B1. multi-key join — operator gate rejects (conditions.size() != 1)
 statement ok
 CREATE TABLE probe_mk AS
 SELECT i AS id,
@@ -167,26 +154,21 @@ SELECT COUNT(*) FROM probe_mk p JOIN build_mk b ON p.k = b.k AND p.k2 = b.k2
 ----
 1002
 
-# B2. expression LHS — CanUseHTProbeFunction rejects (LHS not a BOUND_REF).
+# B2. expression LHS — operator gate rejects (LHS not a BOUND_REF)
 query I
 SELECT COUNT(*) FROM probe p JOIN build b ON (p.k || '') = b.k
 ----
 5000
 
-# B3. probe input is a constant/in-memory VALUES list — structural gate
-#     allows it through, but the per-chunk LHSChunkIsDictionaryEligible
-#     refuses because no storage dictionary is attached.
+# B3. in-memory VALUES list — operator gate accepts, per-chunk gate refuses (no storage dictionary)
 query I
 SELECT COUNT(*) FROM (VALUES ('K1'), ('K2'), ('K3'), ('K1'), ('KX')) v(k)
 JOIN build b ON v.k = b.k
 ----
 4
 
-# B4. INTEGER probe with a sparse build — integer scans don't emit
-#     DICTIONARY_VECTOR (storage uses bitpacking for integers) so the
-#     per-chunk gate refuses. The build range is wide enough that the
-#     perfect-hash executor is disabled too, so the normal probe path
-#     is reached, then falls through to direct Probe().
+# B4. INTEGER probe — per-chunk gate refuses (integer scans bitpack, not DICTIONARY_VECTOR);
+#     build is sparse enough to disable the perfect-hash executor too
 statement ok
 CREATE TABLE int_probe AS
 SELECT (i * 100000)::BIGINT AS k FROM range(5000) t(i)
@@ -206,10 +188,7 @@ SELECT COUNT(*) FROM int_probe p JOIN int_build b ON p.k = b.k
 ----
 5
 
-# B5. perfect-hash join — small integer build with stats fitting the
-#     perfect-hash range bypasses the regular probe entirely, so
-#     CanUseHTProbeFunction (which excludes sink.perfect_join_executor)
-#     never even constructs the wrapper.
+# B5. perfect-hash join — operator gate rejects (sink.perfect_join_executor is set)
 statement ok
 CREATE TABLE ph_probe AS SELECT (i % 7)::INTEGER AS k FROM range(5000) t(i)
 
@@ -236,11 +215,8 @@ three	714
 two	714
 zero	715
 
-# B6. dictionary larger than STANDARD_VECTOR_SIZE — per-chunk gate
-#     refuses because the executor's chunk_fill_ratio can bail on
-#     cache-miss chunks and leave the operator paying the O(N) fan-out
-#     as pure overhead. The build still has every key, so correctness
-#     is unchanged when the direct Probe() path runs instead.
+# B6. dictionary larger than STANDARD_VECTOR_SIZE — per-chunk gate refuses to avoid the
+#     chunk_fill_ratio bailout that would leave the operator paying the fan-out as pure overhead
 statement ok
 CREATE TABLE wide_probe AS
 SELECT i AS id, ('W' || ((i % 4096)::VARCHAR)) AS k
@@ -257,22 +233,16 @@ SELECT COUNT(*) FROM wide_probe p JOIN wide_build b ON p.k = b.k
 ----
 5000
 
-#
-# ---------------------------------------------------------------------------
-# Section C — interaction with the cross-chunk dictionary cache
-# ---------------------------------------------------------------------------
-#
+# Section C: interaction with the cross-chunk dictionary cache.
 
-# C1. multiple chunks share one dictionary id — repeated chunks should
-#     short-circuit through ExecuteFunctionState's per-id cache. We can
-#     only observe correctness from SQL; the cache hit is verified
-#     externally via the std::cerr instrumentation while developing.
+# C1. multiple chunks share one dictionary id — repeated chunks short-circuit through
+#     ExecuteFunctionState's per-id cache; only correctness is observable from SQL
 query I
 SELECT COUNT(*) FROM probe p JOIN build b ON p.k = b.k
 ----
 5000
 
-# C2. probing a checkpointed column twice in one statement is allowed.
+# C2. two probes of the same checkpointed column in one statement
 query I
 SELECT (SELECT COUNT(*) FROM probe p1 JOIN build b1 ON p1.k = b1.k)
      + (SELECT COUNT(*) FROM probe p2 JOIN build b2 ON p2.k = b2.k)

@@ -62,15 +62,15 @@ void HashJoinProbeFunction(DataChunk &args, ExpressionState &state, Vector &resu
 
 	VectorOperations::Hash(local.single_key_chunk.data[0], local.hashes, count);
 
-	// a prior dict-fast-path call may have swapped result's buffer for a DictionaryBuffer (no SetVectorType
-	// support); reallocate as a flat buffer so FlatVector::ValidityMutable below is valid
+	// a prior dict-fast-path call may have left result holding a DictionaryBuffer; reset to a flat buffer
+	// so FlatVector::ValidityMutable below is valid
 	if (result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		result.Initialize();
 	}
 	const idx_t hit_count = ht.LookupHeadPointers(local.single_key_chunk, local.key_state, local.probe_state,
 	                                              local.hashes, result, local.match_sel);
 
-	// miss slots may carry stale salt-collision pointers, so encode hit/miss in the validity mask
+	// encode hit/miss in validity: miss slots may carry stale salt-collision pointers
 	auto &validity = FlatVector::ValidityMutable(result);
 	validity.SetAllInvalid(count);
 	for (idx_t i = 0; i < hit_count; i++) {
