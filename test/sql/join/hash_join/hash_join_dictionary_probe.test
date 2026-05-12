@@ -1,0 +1,279 @@
+# name: test/sql/join/hash_join/hash_join_dictionary_probe.test
+# description: Test dictionary-aware hash-join probing on storage dict-encoded VARCHAR keys
+# group: [hash_join]
+
+statement ok
+PRAGMA enable_verification
+
+# Persistent storage so the probe-side VARCHAR is scanned as a DICTIONARY_VECTOR with a non-empty id
+load {TEST_DIR}/dictionary_probe.db
+
+statement ok
+PRAGMA force_compression='dictionary'
+
+statement ok
+CREATE TABLE dim (k VARCHAR PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO dim VALUES ('A','Alpha'), ('B','Beta'), ('C','Gamma'), ('D','Delta')
+
+statement ok
+CREATE TABLE fact (id INTEGER, k VARCHAR)
+
+statement ok
+INSERT INTO fact SELECT i, CASE i%4 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END FROM range(5000) t(i)
+
+statement ok
+CHECKPOINT
+
+# baseline: inner join over storage dict-encoded VARCHAR probe key
+query I
+SELECT count(*) FROM fact f JOIN dim d ON f.k = d.k
+----
+5000
+
+# verify per-key matches
+query II
+SELECT d.name, count(*) FROM fact f JOIN dim d ON f.k = d.k GROUP BY d.name ORDER BY d.name
+----
+Alpha	1250
+Beta	1250
+Delta	1250
+Gamma	1250
+
+# IS NOT DISTINCT FROM (COMPARE_NOT_DISTINCT_FROM) is also dict-eligible
+query I
+SELECT count(*) FROM fact f JOIN dim d ON f.k IS NOT DISTINCT FROM d.k
+----
+5000
+
+# probe keys that do not match every build row exercise the miss sentinel path
+statement ok
+INSERT INTO fact VALUES (10001, 'X'), (10002, 'Y'), (10003, 'Z')
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) FROM fact f JOIN dim d ON f.k = d.k
+----
+5000
+
+# NULL probe keys must be filtered for COMPARE_EQUAL but matched for NOT DISTINCT
+statement ok
+INSERT INTO fact VALUES (10004, NULL), (10005, NULL)
+
+statement ok
+CHECKPOINT
+
+query I
+SELECT count(*) FROM fact f JOIN dim d ON f.k = d.k
+----
+5000
+
+# IS NOT DISTINCT FROM matches NULL=NULL; use a build table without a PRIMARY KEY so NULL is allowed
+statement ok
+CREATE TABLE dim_nd AS SELECT * FROM dim
+
+statement ok
+INSERT INTO dim_nd VALUES (NULL, 'Null')
+
+query II
+SELECT d.name, count(*) FROM fact f JOIN dim_nd d ON f.k IS NOT DISTINCT FROM d.k GROUP BY d.name ORDER BY d.name
+----
+Alpha	1250
+Beta	1250
+Delta	1250
+Gamma	1250
+Null	2
+
+# build side with duplicate keys exercises chain walking on top of the cache
+statement ok
+CREATE TABLE dim_dup (k VARCHAR, v INTEGER)
+
+statement ok
+INSERT INTO dim_dup VALUES ('A',1),('A',2),('B',10),('B',20),('B',30),('C',100)
+
+query I
+SELECT count(*) FROM fact f JOIN dim_dup d ON f.k = d.k
+----
+7500
+
+query II
+SELECT d.k, sum(d.v) FROM fact f JOIN dim_dup d ON f.k = d.k GROUP BY d.k ORDER BY d.k
+----
+A	3750
+B	75000
+C	125000
+
+# LEFT OUTER join: unmatched probe rows must emit NULL on the build side
+# fact has 3 rows with non-matching keys ('X','Y','Z') and 2 rows with NULL keys -> 5 left-only rows
+query I
+SELECT count(*) FROM fact f LEFT JOIN dim d ON f.k = d.k WHERE d.name IS NULL
+----
+5
+
+# RIGHT OUTER join: unmatched build rows must surface even when every probe key hit
+statement ok
+INSERT INTO dim VALUES ('E','Epsilon')
+
+query II
+SELECT d.name, count(f.id) FROM fact f RIGHT JOIN dim d ON f.k = d.k GROUP BY d.name ORDER BY d.name
+----
+Alpha	1250
+Beta	1250
+Delta	1250
+Epsilon	0
+Gamma	1250
+
+# SEMI join — distinct probe-side keys that match the build
+query I
+SELECT count(*) FROM fact f WHERE f.k IN (SELECT k FROM dim WHERE name IN ('Alpha','Beta'))
+----
+2500
+
+# ANTI join — explicit syntax keeps the dict-encoded probe on the left, build on the right;
+# NULL probe keys never equal a build key so they pass the ANTI filter
+query I
+SELECT count(*) FROM fact f ANTI JOIN dim d ON f.k = d.k
+----
+5
+
+# FULL OUTER — unmatched probe rows AND unmatched build rows must surface
+query II
+SELECT coalesce(d.name, '<no-dim>') AS dim_name, count(*) AS rows
+FROM fact f FULL OUTER JOIN dim d ON f.k = d.k
+GROUP BY dim_name ORDER BY dim_name
+----
+<no-dim>	5
+Alpha	1250
+Beta	1250
+Delta	1250
+Epsilon	1
+Gamma	1250
+
+# MARK join — IN-subquery used as a SELECT-list expression (non-eliminating context)
+query II
+SELECT in_dim, count(*) FROM (
+    SELECT f.id, f.k IN (SELECT k FROM dim WHERE name IN ('Alpha','Beta')) AS in_dim FROM fact f
+) GROUP BY in_dim ORDER BY in_dim NULLS FIRST
+----
+NULL	2
+0	2503
+1	2500
+
+# RIGHT_SEMI — small build (dim) filtered by membership in large probe (fact);
+# the optimizer swaps so fact stays on the probe side and dim rows get the "found" bit
+query I
+SELECT count(*) FROM dim WHERE k IN (SELECT k FROM fact WHERE k IS NOT NULL)
+----
+4
+
+# RIGHT_ANTI — explicit ANTI JOIN; small build (dim) on the right, large dict-encoded
+# probe (fact) on the left after the optimizer's side flip
+query I
+SELECT count(*) FROM dim d ANTI JOIN fact f ON d.k = f.k
+----
+1
+
+# SINGLE — correlated scalar subquery folds into a SINGLE hash join
+query I
+SELECT count(*) FROM (
+    SELECT f.id, (SELECT d.name FROM dim d WHERE d.k = f.k) AS dim_name FROM fact f
+) WHERE dim_name IS NOT NULL
+----
+5000
+
+# FALLBACK: multi-condition join disables the structural gate; result must still match
+statement ok
+CREATE TABLE fact2 (id INTEGER, k VARCHAR, t INTEGER)
+
+statement ok
+INSERT INTO fact2 SELECT id, k, id % 3 FROM fact WHERE k IS NOT NULL
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE dim2 (k VARCHAR, t INTEGER, name VARCHAR)
+
+statement ok
+INSERT INTO dim2 VALUES ('A',0,'A0'),('A',1,'A1'),('B',2,'B2')
+
+query I
+SELECT count(*) FROM fact2 f JOIN dim2 d ON f.k = d.k AND f.t = d.t
+----
+1251
+
+# FALLBACK: expression LHS (not a BoundReferenceExpression) — structural gate rejects
+query I
+SELECT count(*) FROM fact f JOIN dim d ON lower(f.k) = lower(d.k)
+----
+5000
+
+# FALLBACK: STRUCT join key — internal type is STRUCT, structural gate rejects
+statement ok
+CREATE TABLE fact_s (k STRUCT(a VARCHAR))
+
+statement ok
+INSERT INTO fact_s SELECT {'a': k} FROM fact WHERE k IS NOT NULL
+
+statement ok
+CHECKPOINT
+
+statement ok
+CREATE TABLE dim_s (k STRUCT(a VARCHAR), name VARCHAR)
+
+statement ok
+INSERT INTO dim_s VALUES ({'a':'A'},'Alpha'),({'a':'B'},'Beta')
+
+query I
+SELECT count(*) FROM fact_s f JOIN dim_s d ON f.k = d.k
+----
+2500
+
+# debug_force_external requests external mode; whether the structural gate trips
+# or the chunk falls through, result must be unchanged
+statement ok
+SET debug_force_external=true
+
+query I
+SELECT count(*) FROM fact f JOIN dim d ON f.k = d.k
+----
+5000
+
+statement ok
+SET debug_force_external=false
+
+# FALLBACK: in-memory (non-storage) VARCHAR keys arrive flat; per-chunk gate rejects
+statement ok
+ATTACH ':memory:' AS mem
+
+statement ok
+CREATE TABLE mem.dim AS SELECT * FROM dim
+
+statement ok
+CREATE TABLE mem.fact AS SELECT id, k FROM fact LIMIT 100
+
+query I
+SELECT count(*) FROM mem.fact f JOIN mem.dim d ON f.k = d.k
+----
+100
+
+# FALLBACK: perfect-hash join takes over for small contiguous INTEGER keys
+statement ok
+CREATE TABLE mem.dim_i (k INTEGER PRIMARY KEY, name VARCHAR)
+
+statement ok
+INSERT INTO mem.dim_i VALUES (1,'one'),(2,'two'),(3,'three')
+
+statement ok
+CREATE TABLE mem.fact_i (k INTEGER)
+
+statement ok
+INSERT INTO mem.fact_i SELECT (i % 3) + 1 FROM range(300) t(i)
+
+query I
+SELECT count(*) FROM mem.fact_i f JOIN mem.dim_i d ON f.k = d.k
+----
+300
