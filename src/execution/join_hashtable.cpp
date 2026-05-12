@@ -899,7 +899,7 @@ void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleD
 
 bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
                                        ProbeState &probe_state) {
-	// port of GroupedAggregateHashTable::TryAddDictionaryGroups; single-key scope is enforced by the caller
+	// port of GroupedAggregateHashTable::TryAddDictionaryGroups for the join probe path
 	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
 	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
 
@@ -939,8 +939,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			dict_state.capacity = dict_size;
 		}
 		memset(dict_state.found_entry.get(), 0, dict_size * sizeof(bool));
-		// Zero the pointer cache so miss slots read back as nullptr. Hit slots will be overwritten with the
-		// real head-of-chain pointer below; misses stay nullptr for the lifetime of this dictionary_id.
+		// zero the pointer cache so miss slots read back as nullptr - hit slots are overwritten below
 		memset(static_cast<void *>(FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers)), 0,
 		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
@@ -950,7 +949,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		                        dict_state.dictionary_id, dict_size, dict_state.capacity);
 	}
 
-	// for each row, mark its dict slot in found_entry and append to unique_entries the first time we see it
+	// for each row, append its dict slot to unique_entries the first time we see it
 	auto &found_entry = dict_state.found_entry;
 	auto &unique_entries = dict_state.unique_entries;
 	idx_t unique_count = 0;
@@ -967,7 +966,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			unique_values.InitializeEmpty(vector<LogicalType> {equality_types[0]});
 			TupleDataCollection::InitializeChunkState(dict_state.unique_key_state, {equality_types[0]});
 		}
-		// slice the dictionary down to the unique entries, then hash and probe
+		// slice the dictionary
 		unique_values.data[0].Slice(dictionary_vector, unique_entries, unique_count);
 		unique_values.SetCardinality(unique_count);
 
@@ -980,8 +979,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
 		               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
 
-		// remap position-indexed hits onto the per-slot cache via unique_entries; miss slots are left as
-		// nullptr (set at re-bind time) and the fan-out below uses pointer-null as the miss sentinel.
+		// scatter the hit pointers into the per-slot cache via unique_entries; misses stay nullptr
 		const auto new_dict_ptrs = FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers);
 		auto unique_dict_ptrs = FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers);
 		for (idx_t i = 0; i < count; i++) {
@@ -991,7 +989,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		}
 	}
 
-	// fan out: emit the scan_structure shape that Probe() produces via InitializeScanStructure + GetRowPointers
+	// fan out into the scan_structure shape that Probe() produces
 	scan_structure.is_null = false;
 	scan_structure.finished = false;
 	if (join_type != JoinType::INNER) {
@@ -1012,8 +1010,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		const auto ptr = unique_dict_ptrs[dict_idx];
 		scan_structure_ptrs[row_index] = ptr;
 		scan_structure.sel_vector.set_index(kept, row_index);
-		// Miss slots are nullptr (set at re-bind, never overwritten); the chain walker reads
-		// scan_structure.pointers only at sel_vector[0..count), so a miss-row write is invisible.
+		// miss rows leave a stale pointer in scan_structure.pointers, but Next() only reads at sel_vector[0..count)
 		kept += (ptr != nullptr);
 	}
 	scan_structure.count = kept;

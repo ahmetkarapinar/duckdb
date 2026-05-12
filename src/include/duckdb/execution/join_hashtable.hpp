@@ -176,26 +176,19 @@ public:
 		SelectionVector keys_no_match_sel;
 	};
 
-	//! Per-thread cache for dictionary-aware probing.
-	//! Mirrors GroupedAggregateHashTable::AggregateDictionaryState. Miss slots in dictionary_pointers are
-	//! represented as nullptr (the cache is zeroed at re-bind), so no parallel hit-flag array is needed:
-	//! GetRowPointers never returns a null head-of-chain pointer for a real hit.
+	//! Mirrors GroupedAggregateHashTable::AggregateDictionaryState for the join probe path
 	struct ProbeDictionaryState {
 		ProbeDictionaryState();
 
 		//! The current dictionary vector id (if any)
 		string dictionary_id;
 		DataChunk unique_values;
-		//! For the byte-equality re-check inside RowMatcher::Match (via GetRowPointers)
 		TupleDataChunkState unique_key_state;
 		Vector hashes;
-		//! Position-indexed output of GetRowPointers; remapped into dictionary_pointers via unique_entries
 		Vector new_dictionary_pointers;
 		SelectionVector unique_entries;
-		//! Per-slot head-of-chain pointer cache; nullptr means "miss". Zeroed at re-bind, then overwritten
-		//! at hit slots only — miss slots stay nullptr for the lifetime of the current dictionary_id.
+		//! Per-slot head-of-chain pointer cache; nullptr marks a miss
 		unique_ptr<Vector> dictionary_pointers;
-		//! Per-slot "already attempted" flag; persists across chunks until dictionary_id changes
 		unsafe_unique_array<bool> found_entry;
 		idx_t capacity = 0;
 		SelectionVector match_sel;
@@ -207,7 +200,6 @@ public:
 		Vector ht_offsets_and_salts_v;
 		Vector hashes_dense_v;
 		SelectionVector non_empty_sel;
-		//! Per-id cache for dictionary-aware probing
 		ProbeDictionaryState dict_state;
 	};
 
@@ -249,9 +241,7 @@ public:
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
-	//! Dictionary-aware variant of Probe. Returns true if the chunk was handled, false if the LHS keys
-	//! aren't dictionary-eligible and the caller must fall back to Probe().
-	//! Mirrors GroupedAggregateHashTable::TryAddDictionaryGroups.
+	//! Dictionary-aware variant of Probe. Returns false if the LHS keys are not dictionary-eligible.
 	bool TryProbeDictionary(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
 	                        ProbeState &probe_state);
 	//! Scan the HT to construct the full outer join result

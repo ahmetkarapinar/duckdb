@@ -1576,10 +1576,10 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
-//! Structural gate for the dictionary-aware probe path; checked once per operator state.
+//! Structural gate for the dictionary-aware probe path; checked once per operator state
 static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
-		// external joins re-finalise the HT mid-probe, which would invalidate the per-id pointer cache
+		// external joins re-finalize the HT mid-probe, invalidating the per-id pointer cache
 		return false;
 	}
 	if (sink.perfect_join_executor) {
@@ -1601,7 +1601,7 @@ static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
-//! Per-chunk fast-reject; the source-of-truth checks live inside TryProbeDictionary
+//! Per-chunk fast-reject; TryProbeDictionary applies the full eligibility checks
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1628,7 +1628,7 @@ public:
 	JoinHashTable::ProbeState probe_state;
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
-	//! Whether the dictionary-aware probe path may be used for this operator
+	//! Cached result of CanUseDictionaryProbe for this operator state
 	bool dict_probe_enabled = false;
 
 public:
@@ -1739,7 +1739,7 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		} else if (state.dict_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
 		           sink.hash_table->TryProbeDictionary(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 		                                               state.probe_state)) {
-			// dictionary-aware fast path populated scan_structure
+			// scan_structure populated by the dictionary-aware fast path
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}
