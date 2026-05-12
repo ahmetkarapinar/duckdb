@@ -177,8 +177,9 @@ public:
 	};
 
 	//! Per-thread cache for dictionary-aware probing.
-	//! Mirrors GroupedAggregateHashTable::AggregateDictionaryState; dictionary_validity is the join-side
-	//! addition since GetRowPointers can miss whereas FindOrCreateGroups always succeeds.
+	//! Mirrors GroupedAggregateHashTable::AggregateDictionaryState. Miss slots in dictionary_pointers are
+	//! represented as nullptr (the cache is zeroed at re-bind), so no parallel hit-flag array is needed:
+	//! GetRowPointers never returns a null head-of-chain pointer for a real hit.
 	struct ProbeDictionaryState {
 		ProbeDictionaryState();
 
@@ -191,9 +192,9 @@ public:
 		//! Position-indexed output of GetRowPointers; remapped into dictionary_pointers via unique_entries
 		Vector new_dictionary_pointers;
 		SelectionVector unique_entries;
+		//! Per-slot head-of-chain pointer cache; nullptr means "miss". Zeroed at re-bind, then overwritten
+		//! at hit slots only — miss slots stay nullptr for the lifetime of the current dictionary_id.
 		unique_ptr<Vector> dictionary_pointers;
-		//! Per-slot hit flag, parallel to dictionary_pointers
-		unsafe_unique_array<bool> dictionary_validity;
 		//! Per-slot "already attempted" flag; persists across chunks until dictionary_id changes
 		unsafe_unique_array<bool> found_entry;
 		idx_t capacity = 0;

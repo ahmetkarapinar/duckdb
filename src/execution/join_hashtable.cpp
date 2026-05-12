@@ -935,13 +935,14 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		// new dictionary - initialize the per-id cache
 		if (dict_size > dict_state.capacity) {
 			dict_state.dictionary_pointers = make_uniq<Vector>(LogicalType::POINTER, dict_size);
-			dict_state.dictionary_validity = make_unsafe_uniq_array<bool>(dict_size);
 			dict_state.found_entry = make_unsafe_uniq_array<bool>(dict_size);
 			dict_state.capacity = dict_size;
 		}
 		memset(dict_state.found_entry.get(), 0, dict_size * sizeof(bool));
-		// validity persists across chunks under the same id, so it is only zeroed when the id rotates
-		memset(dict_state.dictionary_validity.get(), 0, dict_size * sizeof(bool));
+		// Zero the pointer cache so miss slots read back as nullptr. Hit slots will be overwritten with the
+		// real head-of-chain pointer below; misses stay nullptr for the lifetime of this dictionary_id.
+		memset(static_cast<void *>(FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers)), 0,
+		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
 	} else if (dict_size > dict_state.capacity) {
 		throw InternalException("JoinHashTable - using cached dictionary data but dictionary has changed (dictionary "
@@ -979,14 +980,14 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
 		               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
 
-		// remap position-indexed hits onto the per-slot cache via unique_entries
+		// remap position-indexed hits onto the per-slot cache via unique_entries; miss slots are left as
+		// nullptr (set at re-bind time) and the fan-out below uses pointer-null as the miss sentinel.
 		const auto new_dict_ptrs = FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers);
 		auto unique_dict_ptrs = FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers);
 		for (idx_t i = 0; i < count; i++) {
 			const auto position = dict_state.match_sel.get_index(i);
 			const auto dict_idx = unique_entries.get_index(position);
 			unique_dict_ptrs[dict_idx] = new_dict_ptrs[position];
-			dict_state.dictionary_validity[dict_idx] = true;
 		}
 	}
 
@@ -1004,14 +1005,16 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 
 	auto scan_structure_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
 	const auto unique_dict_ptrs = FlatVector::GetData<data_ptr_t>(*dict_state.dictionary_pointers);
-	const auto validity = dict_state.dictionary_validity.get();
 	idx_t kept = 0;
 	for (idx_t i = 0; i < prepared_count; i++) {
 		const auto row_index = current_sel->get_index(i);
 		const auto dict_idx = offsets.get_index(row_index);
-		scan_structure_ptrs[row_index] = unique_dict_ptrs[dict_idx];
+		const auto ptr = unique_dict_ptrs[dict_idx];
+		scan_structure_ptrs[row_index] = ptr;
 		scan_structure.sel_vector.set_index(kept, row_index);
-		kept += validity[dict_idx];
+		// Miss slots are nullptr (set at re-bind, never overwritten); the chain walker reads
+		// scan_structure.pointers only at sel_vector[0..count), so a miss-row write is invisible.
+		kept += (ptr != nullptr);
 	}
 	scan_structure.count = kept;
 	return true;
