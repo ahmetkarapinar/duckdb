@@ -980,12 +980,12 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
 
 		// remap position-indexed hits onto the per-slot cache via unique_entries
-		const auto src_ptrs = FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers);
-		auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers);
+		const auto new_dict_ptrs = FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers);
+		auto unique_dict_ptrs = FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers);
 		for (idx_t i = 0; i < count; i++) {
 			const auto position = dict_state.match_sel.get_index(i);
 			const auto dict_idx = unique_entries.get_index(position);
-			dst_ptrs[dict_idx] = src_ptrs[position];
+			unique_dict_ptrs[dict_idx] = new_dict_ptrs[position];
 			dict_state.dictionary_validity[dict_idx] = true;
 		}
 	}
@@ -1002,17 +1002,16 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
 	scan_structure.has_null_value_filter = prepared_count < keys.size();
 
-	auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
-	const auto src_ptrs = FlatVector::GetData<data_ptr_t>(*dict_state.dictionary_pointers);
+	auto scan_structure_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
+	const auto unique_dict_ptrs = FlatVector::GetData<data_ptr_t>(*dict_state.dictionary_pointers);
 	const auto validity = dict_state.dictionary_validity.get();
 	idx_t kept = 0;
 	for (idx_t i = 0; i < prepared_count; i++) {
 		const auto row_index = current_sel->get_index(i);
 		const auto dict_idx = offsets.get_index(row_index);
-		if (validity[dict_idx]) {
-			dst_ptrs[row_index] = src_ptrs[dict_idx];
-			scan_structure.sel_vector.set_index(kept++, row_index);
-		}
+		scan_structure_ptrs[row_index] = unique_dict_ptrs[dict_idx];
+		scan_structure.sel_vector.set_index(kept, row_index);
+		kept += validity[dict_idx];
 	}
 	scan_structure.count = kept;
 	return true;
