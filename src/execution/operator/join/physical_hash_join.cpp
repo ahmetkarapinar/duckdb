@@ -3,6 +3,7 @@
 #include "duckdb/common/assert.hpp"
 #include "duckdb/common/projection_index.hpp"
 #include "duckdb/common/radix_partitioning.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/uhugeint.hpp"
@@ -13,6 +14,7 @@
 #include "duckdb/function/aggregate/distributive_function_utils.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
+#include "duckdb/function/scalar/hash_join_probe_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/query_profiler.hpp"
 #include "duckdb/main/settings.hpp"
@@ -25,6 +27,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
@@ -1316,6 +1319,23 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
+//! State for the ht_probe wrapper; only constructed when CanUseHTProbeFunction holds.
+//! expr must be declared before executor: the executor holds references into expr and must be destroyed first.
+class HTProbeState {
+public:
+	HTProbeState(ClientContext &context, Allocator &allocator, unique_ptr<BoundFunctionExpression> expr_p,
+	             const LogicalType &key_type)
+	    : expr(std::move(expr_p)), executor(context), pointers(LogicalType::POINTER) {
+		executor.AddExpression(*expr);
+		arg_chunk.Initialize(allocator, vector<LogicalType> {key_type});
+	}
+
+	unique_ptr<BoundFunctionExpression> expr;
+	ExpressionExecutor executor;
+	Vector pointers;
+	DataChunk arg_chunk;
+};
+
 class HashJoinOperatorState : public CachingOperatorState {
 public:
 	explicit HashJoinOperatorState(ClientContext &context, HashJoinGlobalSinkState &sink)
@@ -1335,11 +1355,58 @@ public:
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
 
+	//! Dictionary-aware probe wrapper; populated only when CanUseHTProbeFunction holds
+	unique_ptr<HTProbeState> ht_probe;
+
 public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
 		context.thread.profiler.Flush(op);
 	}
 };
+
+//! Operator-level gate for the ht_probe wrapper: in-memory hash table, no perfect-hash executor, single
+//! equality (= or IS NOT DISTINCT FROM) on a column-ref LHS. Per-chunk shape gate is LHSChunkIsDictionaryEligible.
+static bool CanUseHTProbeFunction(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
+	if (sink.external) {
+		return false;
+	}
+	if (sink.perfect_join_executor) {
+		return false;
+	}
+	if (conditions.size() != 1) {
+		return false;
+	}
+	const auto &cond = conditions[0];
+	const auto cmp = cond.GetComparisonType();
+	if (cmp != ExpressionType::COMPARE_EQUAL && cmp != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		return false;
+	}
+	if (cond.GetLHS().GetExpressionClass() != ExpressionClass::BOUND_REF) {
+		return false;
+	}
+	return true;
+}
+
+//! Per-chunk gate mirroring TryExecuteDictionaryExpression's eligibility checks.
+//! Also refuses dict_size > STANDARD_VECTOR_SIZE: on cache misses the executor's chunk_fill_ratio gate may
+//! fall through to the regular callback that probes all N rows, leaving the operator paying the fan-out in
+//! InitializeScanStructureFromPointers as pure overhead. Cache state is invisible here, so we refuse the class.
+static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
+	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+		return false;
+	}
+	const auto size_opt = DictionaryVector::DictionarySize(lhs_key);
+	if (!size_opt.IsValid()) {
+		return false;
+	}
+	if (DictionaryVector::DictionaryId(lhs_key).empty()) {
+		return false;
+	}
+	if (size_opt.GetIndex() > STANDARD_VECTOR_SIZE) {
+		return false;
+	}
+	return true;
+}
 
 unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &context) const {
 	auto &allocator = BufferAllocator::Get(context.client);
@@ -1364,6 +1431,22 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 	if (sink.external) {
 		state->spill_chunk.Initialize(allocator, sink.probe_types);
 		sink.InitializeProbeSpill();
+	}
+
+	if (CanUseHTProbeFunction(sink, conditions)) {
+		// wrap the probe in an ExpressionExecutor so TryExecuteDictionaryExpression fires on dictionary inputs
+		auto fun = HashJoinProbeScalarFun::GetFunction(condition_types[0]);
+		BoundScalarFunction bound_function(fun);
+
+		auto bind_data = make_uniq<HashJoinProbeFunctionData>(sink.hash_table.get(), condition_types[0]);
+
+		static constexpr idx_t HT_PROBE_KEY_COLUMN_INDEX = 0;
+		vector<unique_ptr<Expression>> children;
+		children.push_back(make_uniq<BoundReferenceExpression>(condition_types[0], HT_PROBE_KEY_COLUMN_INDEX));
+
+		auto expr =
+		    make_uniq<BoundFunctionExpression>(std::move(bound_function), std::move(children), std::move(bind_data));
+		state->ht_probe = make_uniq<HTProbeState>(context.client, allocator, std::move(expr), condition_types[0]);
 	}
 
 	return std::move(state);
@@ -1413,6 +1496,14 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
+		} else if (state.ht_probe && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0])) {
+			// only route through ht_probe when the dict fast path will fire; the wrapper is otherwise pure overhead
+			auto &probe = *state.ht_probe;
+			probe.arg_chunk.data[0].Reference(state.lhs_join_keys.data[0]);
+			probe.arg_chunk.SetCardinality(state.lhs_join_keys.size());
+			probe.executor.ExecuteExpression(probe.arg_chunk, probe.pointers);
+			sink.hash_table->InitializeScanStructureFromPointers(state.scan_structure, state.lhs_join_keys,
+			                                                     state.join_key_state, probe.pointers);
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}

@@ -823,8 +823,8 @@ void JoinHashTable::Finalize(idx_t chunk_idx_from, idx_t chunk_idx_to, bool para
 	} while (iterator.Next());
 }
 
-void JoinHashTable::InitializeScanStructure(ScanStructure &scan_structure, DataChunk &keys,
-                                            TupleDataChunkState &key_state, const SelectionVector *&current_sel) {
+idx_t JoinHashTable::PrepareScanStructure(ScanStructure &scan_structure, DataChunk &keys,
+                                          TupleDataChunkState &key_state, const SelectionVector *&current_sel) {
 	D_ASSERT(Count() > 0); // should be handled before
 	D_ASSERT(finalized);
 
@@ -837,13 +837,69 @@ void JoinHashTable::InitializeScanStructure(ScanStructure &scan_structure, DataC
 
 	// first prepare the keys for probing
 	TupleDataCollection::ToUnifiedFormat(key_state, keys);
-	scan_structure.count = PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
+	const idx_t prepared_count =
+	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
+	scan_structure.has_null_value_filter = prepared_count < keys.size();
+	return prepared_count;
+}
 
-	if (scan_structure.count < keys.size()) {
-		scan_structure.has_null_value_filter = true;
-	} else {
-		scan_structure.has_null_value_filter = false;
+void JoinHashTable::InitializeScanStructure(ScanStructure &scan_structure, DataChunk &keys,
+                                            TupleDataChunkState &key_state, const SelectionVector *&current_sel) {
+	scan_structure.count = PrepareScanStructure(scan_structure, keys, key_state, current_sel);
+}
+
+idx_t JoinHashTable::LookupHeadPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state,
+                                        Vector &hashes, Vector &result_pointers, SelectionVector &match_sel) {
+	idx_t count = keys.size();
+	GetRowPointers(keys, key_state, state, hashes, /*sel=*/nullptr, count, result_pointers, match_sel,
+	               /*has_sel=*/false);
+	return count;
+}
+
+void JoinHashTable::InitializeScanStructureFromPointers(ScanStructure &scan_structure, DataChunk &keys,
+                                                        TupleDataChunkState &key_state, Vector &pointers) {
+	const SelectionVector *current_sel;
+	const idx_t prepared_count = PrepareScanStructure(scan_structure, keys, key_state, current_sel);
+
+	// read through unified format so a DICTIONARY_VECTOR pointers input is not flattened
+	UnifiedVectorFormat ptr_format;
+	pointers.ToUnifiedFormat(ptr_format);
+	const auto src_ptrs = UnifiedVectorFormat::GetData<data_ptr_t>(ptr_format);
+	const auto dst_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
+
+	// hit/miss is encoded in validity: miss slots may carry stale salt-collision pointers
+	if (!scan_structure.has_null_value_filter && ptr_format.validity.CannotHaveNull()) {
+		// fast path: identity sel and every probe hits
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto src_idx = ptr_format.sel->get_index(i);
+			dst_ptrs[i] = src_ptrs[src_idx];
+			scan_structure.sel_vector.set_index(i, i);
+		}
+		scan_structure.count = prepared_count;
+		return;
 	}
+
+	idx_t kept = 0;
+	if (scan_structure.has_null_value_filter) {
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto row_index = current_sel->get_index(i);
+			const auto src_idx = ptr_format.sel->get_index(row_index);
+			if (ptr_format.validity.RowIsValid(src_idx)) {
+				dst_ptrs[row_index] = src_ptrs[src_idx];
+				scan_structure.sel_vector.set_index(kept++, row_index);
+			}
+		}
+	} else {
+		// no NULL filter: current_sel is the identity, so row_index == i
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto src_idx = ptr_format.sel->get_index(i);
+			if (ptr_format.validity.RowIsValid(src_idx)) {
+				dst_ptrs[i] = src_ptrs[src_idx];
+				scan_structure.sel_vector.set_index(kept++, i);
+			}
+		}
+	}
+	scan_structure.count = kept;
 }
 
 void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,

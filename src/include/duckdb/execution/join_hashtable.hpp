@@ -221,6 +221,14 @@ public:
 	//! Probe the HT with the given input chunk, resulting in the given result
 	void Probe(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state, ProbeState &probe_state,
 	           optional_ptr<Vector> precomputed_hashes = nullptr);
+	//! Look up the head-of-chain pointer for each key. Hits are written to `result_pointers` at the matched
+	//! row index and recorded in `match_sel`; misses are not written. Returns the number of hits.
+	idx_t LookupHeadPointers(DataChunk &keys, TupleDataChunkState &key_state, ProbeState &state, Vector &hashes,
+	                         Vector &result_pointers, SelectionVector &match_sel);
+	//! Build a ScanStructure from an already-resolved head-pointer vector; misses are encoded as invalid in
+	//! the pointer vector's validity mask
+	void InitializeScanStructureFromPointers(ScanStructure &scan_structure, DataChunk &keys,
+	                                         TupleDataChunkState &key_state, Vector &pointers);
 	//! Scan the HT to construct the full outer join result
 	void ScanFullOuter(JoinHTScanState &state, Vector &addresses, DataChunk &result) const;
 
@@ -377,6 +385,10 @@ public:
 private:
 	void InitializeScanStructure(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
 	                             const SelectionVector *&current_sel);
+	//! Shared prelude for InitializeScanStructure(FromPointers): resets scan-structure flags and runs
+	//! PrepareKeys. Returns the number of rows that survived NULL filtering.
+	idx_t PrepareScanStructure(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
+	                           const SelectionVector *&current_sel);
 	void Hash(DataChunk &keys, const SelectionVector &sel, idx_t count, Vector &hashes);
 
 	bool UseSalt() const;
