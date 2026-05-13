@@ -947,6 +947,20 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
 		dict_state.resolved_count = 0;
+		// pre-mark NULL child slots as resolved so the gate below can saturate even when
+		// the probe never references the storage-reserved NULL sentinel slot (PrepareKeys
+		// drops NULL probe rows at fan-out time, so their cache entries stay nullptr)
+		if (dictionary_vector.GetVectorType() == VectorType::FLAT_VECTOR) {
+			const auto &child_validity = FlatVector::Validity(dictionary_vector);
+			if (child_validity.CanHaveNull()) {
+				for (idx_t i = 0; i < dict_size; i++) {
+					if (!child_validity.RowIsValid(i)) {
+						dict_state.found_entry[i] = true;
+						dict_state.resolved_count++;
+					}
+				}
+			}
+		}
 	} else if (dict_size > dict_state.capacity) {
 		throw InternalException("JoinHashTable - using cached dictionary data but dictionary has changed (dictionary "
 		                        "id %s - dict size %d, current capacity %d)",
@@ -974,7 +988,6 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			unique_values.InitializeEmpty(vector<LogicalType> {equality_types[0]});
 			TupleDataCollection::InitializeChunkState(dict_state.unique_key_state, {equality_types[0]});
 		}
-		// slice the dictionary
 		unique_values.data[0].Slice(dictionary_vector, unique_entries, unique_count);
 		unique_values.SetCardinality(unique_count);
 
