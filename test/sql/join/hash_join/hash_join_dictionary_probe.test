@@ -5,7 +5,7 @@
 statement ok
 PRAGMA enable_verification
 
-# persistent storage with dictionary compression so the probe-side VARCHAR arrives as a DICTIONARY_VECTOR with an id
+# persistent + dictionary compression so probe-side VARCHAR keys arrive as DICTIONARY_VECTOR with a non-empty id
 load {TEST_DIR}/dictionary_probe.db
 
 statement ok
@@ -59,7 +59,7 @@ SELECT count(*) FROM fact f JOIN dim d ON f.k = d.k
 ----
 5000
 
-# NULL probe keys: filtered out under = , matched under IS NOT DISTINCT FROM
+# NULL probe keys: filtered out under =, matched under IS NOT DISTINCT FROM
 statement ok
 INSERT INTO fact VALUES (10004, NULL), (10005, NULL)
 

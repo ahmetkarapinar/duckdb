@@ -899,7 +899,6 @@ void JoinHashTable::Probe(ScanStructure &scan_structure, DataChunk &keys, TupleD
 
 bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
                                        ProbeState &probe_state) {
-	// port of GroupedAggregateHashTable::TryAddDictionaryGroups for the join probe path
 	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
 	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
 
@@ -919,7 +918,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	const idx_t dict_size = opt_dict_size.GetIndex();
 	const auto &dictionary_id = DictionaryVector::DictionaryId(dict_col);
 	if (dictionary_id.empty()) {
-		// no id, can't cache across vectors - only worth it if the dictionary is much smaller than the chunk
+		// no id - can't cache across vectors, only use dict path if it is much smaller than the chunk
 		if (dict_size * DICTIONARY_THRESHOLD >= keys.size()) {
 			return false;
 		}
@@ -927,8 +926,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		return false;
 	}
 	if (dict_size == 0) {
-		// defensive: a 0-sized dictionary with a non-empty id would otherwise reach the re-bind branch and
-		// dereference a still-null dictionary_pointers unique_ptr (the dict_size > capacity allocation is skipped)
+		// the re-bind branch below skips allocation when dict_size == 0 and would then deref a null Vector
 		return false;
 	}
 
@@ -944,7 +942,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			dict_state.capacity = dict_size;
 		}
 		memset(dict_state.found_entry.get(), 0, dict_size * sizeof(bool));
-		// zero the pointer cache so miss slots read back as nullptr - hit slots are overwritten below
+		// zero the cache so unresolved slots read back as nullptr - the miss sentinel
 		memset(static_cast<void *>(FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers)), 0,
 		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
@@ -956,7 +954,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	}
 
 	// for each row, append its dict slot to unique_entries the first time we see it
-	// skip the walk on warm chunks where the dictionary is already fully resolved - no slot can be new
+	// skip the walk once every slot is resolved - no further slot can appear
 	auto &found_entry = dict_state.found_entry;
 	auto &unique_entries = dict_state.unique_entries;
 	idx_t unique_count = 0;
@@ -989,7 +987,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
 		               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
 
-		// scatter the hit pointers into the per-slot cache via unique_entries; misses stay nullptr
+		// remap hits from position to dict slot; missed slots stay nullptr from the rebind memset
 		const auto new_dict_ptrs = FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers);
 		auto unique_dict_ptrs = FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers);
 		for (idx_t i = 0; i < count; i++) {
@@ -999,7 +997,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		}
 	}
 
-	// fan out into the scan_structure shape that Probe() produces
+	// fan out the cache into the scan_structure shape that Probe() produces
 	scan_structure.is_null = false;
 	scan_structure.finished = false;
 	if (join_type != JoinType::INNER) {
@@ -1020,7 +1018,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		const auto ptr = unique_dict_ptrs[dict_idx];
 		scan_structure_ptrs[row_index] = ptr;
 		scan_structure.sel_vector.set_index(kept, row_index);
-		// miss rows leave a stale pointer in scan_structure.pointers, but Next() only reads at sel_vector[0..count)
+		// miss rows leave a stale pointer, but Next() only reads pointers at positions in sel_vector[0..count)
 		kept += (ptr != nullptr);
 	}
 	scan_structure.count = kept;

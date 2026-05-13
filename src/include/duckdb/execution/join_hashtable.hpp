@@ -192,8 +192,8 @@ public:
 		unsafe_unique_array<bool> found_entry;
 		idx_t capacity = 0;
 		SelectionVector match_sel;
-		//! Cumulative dict slots resolved since the last rebind; once it reaches dict_size the unique-entries walk
-		//! can be skipped because no further slot can be new
+		//! Number of slots resolved since the last rebind - the unique-entries walk is skipped once this reaches
+		//! dict_size
 		idx_t resolved_count = 0;
 	};
 

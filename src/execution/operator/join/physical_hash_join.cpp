@@ -1576,7 +1576,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
-//! Structural gate for the dictionary-aware probe path; checked once per operator state
+//! Structural gate for the dictionary-aware probe path; evaluated once per operator state
 static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
 		// external joins re-finalize the HT mid-probe, invalidating the per-id pointer cache
@@ -1601,7 +1601,7 @@ static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vec
 	return true;
 }
 
-//! Per-chunk fast-reject; TryProbeDictionary applies the full eligibility checks
+//! Per-chunk fast-reject so non-dictionary chunks skip the TryProbeDictionary call entirely
 static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	if (lhs_key.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return false;
@@ -1739,7 +1739,7 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 		} else if (state.dict_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
 		           sink.hash_table->TryProbeDictionary(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 		                                               state.probe_state)) {
-			// scan_structure populated by the dictionary-aware fast path
+			// scan_structure populated by the dictionary-aware path
 		} else {
 			sink.hash_table->Probe(state.scan_structure, state.lhs_join_keys, state.join_key_state, state.probe_state);
 		}
