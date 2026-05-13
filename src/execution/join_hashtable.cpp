@@ -943,6 +943,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		memset(static_cast<void *>(FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers)), 0,
 		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
+		dict_state.resolved_count = 0;
 	} else if (dict_size > dict_state.capacity) {
 		throw InternalException("JoinHashTable - using cached dictionary data but dictionary has changed (dictionary "
 		                        "id %s - dict size %d, current capacity %d)",
@@ -950,14 +951,18 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	}
 
 	// for each row, append its dict slot to unique_entries the first time we see it
+	// skip the walk on warm chunks where the dictionary is already fully resolved - no slot can be new
 	auto &found_entry = dict_state.found_entry;
 	auto &unique_entries = dict_state.unique_entries;
 	idx_t unique_count = 0;
-	for (idx_t i = 0; i < keys.size(); i++) {
-		const auto dict_idx = offsets.get_index(i);
-		unique_entries.set_index(unique_count, dict_idx);
-		unique_count += !found_entry[dict_idx];
-		found_entry[dict_idx] = true;
+	if (dict_state.resolved_count < dict_size) {
+		for (idx_t i = 0; i < keys.size(); i++) {
+			const auto dict_idx = offsets.get_index(i);
+			unique_entries.set_index(unique_count, dict_idx);
+			unique_count += !found_entry[dict_idx];
+			found_entry[dict_idx] = true;
+		}
+		dict_state.resolved_count += unique_count;
 	}
 
 	if (unique_count > 0) {
