@@ -926,6 +926,11 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	} else if (dict_size >= MAX_DICTIONARY_SIZE_THRESHOLD) {
 		return false;
 	}
+	if (dict_size == 0) {
+		// defensive: a 0-sized dictionary with a non-empty id would otherwise reach the re-bind branch and
+		// dereference a still-null dictionary_pointers unique_ptr (the dict_size > capacity allocation is skipped)
+		return false;
+	}
 
 	auto &dictionary_vector = DictionaryVector::Child(dict_col);
 	auto &offsets = DictionaryVector::SelVector(dict_col);

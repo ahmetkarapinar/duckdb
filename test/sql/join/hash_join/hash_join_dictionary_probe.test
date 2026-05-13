@@ -12,13 +12,13 @@ statement ok
 PRAGMA force_compression='dictionary'
 
 statement ok
-CREATE TABLE dim (k VARCHAR PRIMARY KEY, name VARCHAR);
+CREATE OR REPLACE TABLE dim (k VARCHAR PRIMARY KEY, name VARCHAR);
 
 statement ok
 INSERT INTO dim VALUES ('A','Alpha'), ('B','Beta'), ('C','Gamma'), ('D','Delta')
 
 statement ok
-CREATE TABLE fact (id INTEGER, k VARCHAR)
+CREATE OR REPLACE TABLE fact (id INTEGER, k VARCHAR)
 
 statement ok
 INSERT INTO fact SELECT i, CASE i%4 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END FROM range(5000) t(i)
@@ -73,7 +73,7 @@ SELECT count(*) FROM fact f JOIN dim d ON f.k = d.k
 
 # NULL=NULL under IS NOT DISTINCT FROM; build table has no PRIMARY KEY so NULL is allowed
 statement ok
-CREATE TABLE dim_nd AS SELECT * FROM dim
+CREATE OR REPLACE TABLE dim_nd AS SELECT * FROM dim
 
 statement ok
 INSERT INTO dim_nd VALUES (NULL, 'Null')
@@ -89,7 +89,7 @@ Null	2
 
 # duplicate build keys force chain walking through the cached head-of-chain pointer
 statement ok
-CREATE TABLE dim_dup (k VARCHAR, v INTEGER)
+CREATE OR REPLACE TABLE dim_dup (k VARCHAR, v INTEGER)
 
 statement ok
 INSERT INTO dim_dup VALUES ('A',1),('A',2),('B',10),('B',20),('B',30),('C',100)
@@ -182,7 +182,7 @@ SELECT count(*) FROM (
 
 # fallback: multi-condition join disables the structural gate
 statement ok
-CREATE TABLE fact2 (id INTEGER, k VARCHAR, t INTEGER)
+CREATE OR REPLACE TABLE fact2 (id INTEGER, k VARCHAR, t INTEGER)
 
 statement ok
 INSERT INTO fact2 SELECT id, k, id % 3 FROM fact WHERE k IS NOT NULL
@@ -191,7 +191,7 @@ statement ok
 CHECKPOINT
 
 statement ok
-CREATE TABLE dim2 (k VARCHAR, t INTEGER, name VARCHAR)
+CREATE OR REPLACE TABLE dim2 (k VARCHAR, t INTEGER, name VARCHAR)
 
 statement ok
 INSERT INTO dim2 VALUES ('A',0,'A0'),('A',1,'A1'),('B',2,'B2')
@@ -209,7 +209,7 @@ SELECT count(*) FROM fact f JOIN dim d ON lower(f.k) = lower(d.k)
 
 # fallback: STRUCT join key - structural gate rejects
 statement ok
-CREATE TABLE fact_s (k STRUCT(a VARCHAR))
+CREATE OR REPLACE TABLE fact_s (k STRUCT(a VARCHAR))
 
 statement ok
 INSERT INTO fact_s SELECT {'a': k} FROM fact WHERE k IS NOT NULL
@@ -218,7 +218,7 @@ statement ok
 CHECKPOINT
 
 statement ok
-CREATE TABLE dim_s (k STRUCT(a VARCHAR), name VARCHAR)
+CREATE OR REPLACE TABLE dim_s (k STRUCT(a VARCHAR), name VARCHAR)
 
 statement ok
 INSERT INTO dim_s VALUES ({'a':'A'},'Alpha'),({'a':'B'},'Beta')
