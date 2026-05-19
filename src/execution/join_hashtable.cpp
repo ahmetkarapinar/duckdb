@@ -943,8 +943,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		}
 		memset(dict_state.found_entry.get(), 0, dict_size * sizeof(bool));
 		// zero the cache - an unresolved slot reads back as nullptr, the miss sentinel
-		memset(static_cast<void *>(FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers)), 0,
-		       dict_size * sizeof(data_ptr_t));
+		memset(FlatVector::GetDataMutable(*dict_state.dictionary_pointers), 0, dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
 		dict_state.resolved_count = 0;
 		// storage dictionaries reserve a NULL sentinel slot that non-NULL probe rows never
