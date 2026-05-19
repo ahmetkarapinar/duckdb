@@ -1016,7 +1016,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		memset(scan_structure.found_match.get(), 0, sizeof(bool) * STANDARD_VECTOR_SIZE);
 	}
 	TupleDataCollection::ToUnifiedFormat(key_state, keys);
-	const SelectionVector *current_sel;
+	optional_ptr<const SelectionVector> current_sel;
 	const idx_t prepared_count =
 	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
 	scan_structure.has_null_value_filter = prepared_count < keys.size();
@@ -1086,7 +1086,7 @@ bool JoinHashTable::TryProbeConstant(ScanStructure &scan_structure, DataChunk &k
 		memset(scan_structure.found_match.get(), 0, sizeof(bool) * STANDARD_VECTOR_SIZE);
 	}
 	TupleDataCollection::ToUnifiedFormat(key_state, keys);
-	const SelectionVector *current_sel;
+	optional_ptr<const SelectionVector> current_sel;
 	const idx_t prepared_count =
 	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
 	scan_structure.has_null_value_filter = prepared_count < keys.size();
