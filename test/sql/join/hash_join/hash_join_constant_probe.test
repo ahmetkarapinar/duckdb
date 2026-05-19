@@ -30,22 +30,59 @@ SELECT count(*) FROM (SELECT 'CHF' AS ccy, id FROM fact) t JOIN dim d ON t.ccy =
 ----
 0
 
-# numeric constant probe key
+# numeric constant probe key from a constant-compressed storage column
+#
+# A numeric *literal* projected as a probe key (SELECT 7 AS region) is constant-folded
+# by the optimizer into a build-side filter; the build side then collapses to a tiny
+# integer range and a Perfect Hash Join is chosen, bypassing TryProbeConstant entirely.
+# To genuinely exercise the numeric constant probe path the key must arrive from a real
+# constant-compressed storage column - a column physically clustered so each row group
+# holds a single value is constant-compressed on disk and scanned as a CONSTANT_VECTOR.
+# The build side spans a key range wider than the Perfect Hash Join threshold (1 << 20),
+# so the regular hash-join probe path is used.
+
+# storage only constant-compresses checkpointed segments, so a persistent database is needed
 statement ok
-CREATE TABLE dim_i (k INTEGER PRIMARY KEY, name VARCHAR)
+ATTACH '{TEST_DIR}/hash_join_constant_probe.db' AS cdb
+
+# build-side keys 0 and 2000000 span a range > 1 << 20 - too wide for a Perfect Hash Join
+statement ok
+CREATE OR REPLACE TABLE cdb.dim_i (k INTEGER PRIMARY KEY, name VARCHAR)
 
 statement ok
-INSERT INTO dim_i VALUES (7,'seven'), (8,'eight')
+INSERT INTO cdb.dim_i VALUES (0,'zero'), (2000000,'twomillion')
 
-query I
-SELECT count(*) FROM (SELECT 7 AS region, id FROM fact) t JOIN dim_i d ON t.region = d.k
-----
-5000
+# fact_num.k is physically clustered: each 122880-row group (the row group size) holds a
+# single value, so the segment is constant-compressed and scanned as a CONSTANT_VECTOR
+statement ok
+CREATE OR REPLACE TABLE cdb.fact_num (k INTEGER)
 
+statement ok
+INSERT INTO cdb.fact_num SELECT (i // 122880) * 2000000 FROM range(245760) t(i)
+
+# fact_num_miss.k is clustered to values that bracket the build keys but match none of them
+statement ok
+CREATE OR REPLACE TABLE cdb.fact_num_miss (k INTEGER)
+
+statement ok
+INSERT INTO cdb.fact_num_miss SELECT (i // 122880) * 2200000 - 100000 FROM range(245760) t(i)
+
+# flush to storage so the clustered segments are constant-compressed
+statement ok
+CHECKPOINT cdb
+
+# numeric constant probe key - hit (every row group's value is a build-side key)
 query I
-SELECT count(*) FROM (SELECT 99 AS region, id FROM fact) t JOIN dim_i d ON t.region = d.k
+SELECT count(*) FROM cdb.fact_num f JOIN cdb.dim_i d ON f.k = d.k
 ----
-0
+245760
+
+# numeric constant probe key - miss (no row group's value is a build-side key); a LEFT
+# join keeps every probe row, so the constant keys still reach TryProbeConstant
+query I
+SELECT count(*) FROM cdb.fact_num_miss f LEFT JOIN cdb.dim_i d ON f.k = d.k WHERE d.k IS NULL
+----
+245760
 
 # constant NULL probe key under equality - NULL = anything is never true
 query I
