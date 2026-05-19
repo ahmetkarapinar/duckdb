@@ -926,7 +926,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		return false;
 	}
 	if (dict_size == 0) {
-		// the re-bind branch below skips allocation when dict_size == 0 and would then deref a null Vector
+		// the cache below is never allocated for an empty dictionary - avoid dereferencing a null Vector
 		return false;
 	}
 
@@ -942,7 +942,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 			dict_state.capacity = dict_size;
 		}
 		memset(dict_state.found_entry.get(), 0, dict_size * sizeof(bool));
-		// zero the cache so unresolved slots read back as nullptr - the miss sentinel
+		// zero the cache - an unresolved slot reads back as nullptr, the miss sentinel
 		memset(static_cast<void *>(FlatVector::GetDataMutable<data_ptr_t>(*dict_state.dictionary_pointers)), 0,
 		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
@@ -968,8 +968,7 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		                        dict_state.dictionary_id, dict_size, dict_state.capacity);
 	}
 
-	// collect each dict slot once; skip the walk once every slot is resolved, since no
-	// later chunk under the same id can introduce a new one
+	// collect each dict slot once - skip the walk entirely once every slot is resolved
 	auto &found_entry = dict_state.found_entry;
 	auto &unique_entries = dict_state.unique_entries;
 	idx_t unique_count = 0;
@@ -1056,8 +1055,8 @@ bool JoinHashTable::TryProbeConstant(ScanStructure &scan_structure, DataChunk &k
 	}
 #endif
 
-	// resolve the single distinct key once - a constant vector carries no dictionary id, so
-	// there is no per-id cache: every chunk independently does exactly one hash-table lookup
+	// constant vectors carry no dictionary id, so there is no cross-chunk cache - resolve the
+	// single distinct key with one hash-table lookup per chunk
 	auto &dict_state = probe_state.dict_state;
 	auto &unique_values = dict_state.unique_values;
 	if (unique_values.ColumnCount() == 0) {
@@ -1073,9 +1072,8 @@ bool JoinHashTable::TryProbeConstant(ScanStructure &scan_structure, DataChunk &k
 	auto &hashes = dict_state.hashes;
 	VectorOperations::Hash(unique_values.data[0], hashes, 1);
 
-	// count stays 1 when the key hashes to a non-empty bucket and 0 otherwise; resolved_ptr is a
-	// chain-head, not a confirmed match - a real key-miss is still rejected by the chain walk in
-	// Next(). A NULL constant key also resolves correctly, as RowMatcher honours null equality.
+	// resolved_ptr is a chain-head, not a confirmed match - a real key-miss is still rejected by
+	// the chain walk in Next(). A NULL constant key resolves correctly via RowMatcher null equality.
 	idx_t count = 1;
 	GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
 	               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
@@ -1097,8 +1095,7 @@ bool JoinHashTable::TryProbeConstant(ScanStructure &scan_structure, DataChunk &k
 	auto scan_structure_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
 	idx_t kept = 0;
 	if (resolved_ptr) {
-		// PrepareKeys already dropped NULL probe rows for equality joins; the rest all share
-		// the one resolved chain-head pointer
+		// PrepareKeys dropped NULL probe rows - the rest all share the one resolved chain-head
 		for (idx_t i = 0; i < prepared_count; i++) {
 			const auto row_index = current_sel->get_index(i);
 			scan_structure_ptrs[row_index] = resolved_ptr;

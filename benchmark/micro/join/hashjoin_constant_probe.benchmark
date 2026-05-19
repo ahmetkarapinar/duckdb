@@ -6,9 +6,8 @@ name Hash Join Constant Probe
 group join
 storage persistent
 
-# fact.k is physically clustered: each row group holds a single value, so storage
-# constant-compresses the segment and scanning yields a CONSTANT_VECTOR probe key.
-# Keys are spread over a wide range so the build side does not qualify for a
+# fact.k is physically clustered so each row group holds a single value - the segment is
+# constant-compressed and scanned as a CONSTANT_VECTOR. Keys span a wide range to avoid a
 # perfect hash join, keeping the probe on the regular hash-join path.
 load
 CREATE TABLE dim AS SELECT i * 1000000 AS k FROM range(9) t(i);

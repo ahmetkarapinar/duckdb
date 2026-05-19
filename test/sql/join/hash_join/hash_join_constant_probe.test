@@ -30,16 +30,10 @@ SELECT count(*) FROM (SELECT 'CHF' AS ccy, id FROM fact) t JOIN dim d ON t.ccy =
 ----
 0
 
-# numeric constant probe key from a constant-compressed storage column
-#
-# A numeric *literal* projected as a probe key (SELECT 7 AS region) is constant-folded
-# by the optimizer into a build-side filter; the build side then collapses to a tiny
-# integer range and a Perfect Hash Join is chosen, bypassing TryProbeConstant entirely.
-# To genuinely exercise the numeric constant probe path the key must arrive from a real
-# constant-compressed storage column - a column physically clustered so each row group
-# holds a single value is constant-compressed on disk and scanned as a CONSTANT_VECTOR.
-# The build side spans a key range wider than the Perfect Hash Join threshold (1 << 20),
-# so the regular hash-join probe path is used.
+# numeric constant probe key from a constant-compressed storage column.
+# A numeric literal probe key is constant-folded into a build-side filter and picks a Perfect
+# Hash Join, so the key must instead come from a real constant-compressed column. Build keys
+# span a range wider than the Perfect Hash Join threshold (1 << 20) to stay on the probe path.
 
 # storage only constant-compresses checkpointed segments, so a persistent database is needed
 statement ok
