@@ -192,8 +192,7 @@ public:
 		unsafe_unique_array<bool> found_entry;
 		idx_t capacity = 0;
 		SelectionVector match_sel;
-		//! Slots known to not need a fresh lookup. Seeded at rebind with the child's NULL slots and
-		//! bumped as the unique-entries walk discovers new keys; the walk is skipped once it reaches dict_size.
+		//! Number of dict slots already resolved; the unique-entries walk is skipped once it reaches dict_size
 		idx_t resolved_count = 0;
 	};
 

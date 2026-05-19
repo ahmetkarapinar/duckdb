@@ -947,14 +947,10 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		       dict_size * sizeof(data_ptr_t));
 		dict_state.dictionary_id = dictionary_id;
 		dict_state.resolved_count = 0;
-		// pre-mark NULL child slots as resolved so the gate below can saturate even when
-		// the probe never references the storage-reserved NULL sentinel slot. Only safe for
-		// regular equality joins: there PrepareKeys drops NULL probe rows at fan-out time, so
-		// the NULL slot is never probed and its cache entry staying nullptr is harmless. Under
-		// NOT DISTINCT FROM (null_values_are_equal[0] == true) PrepareKeys keeps NULL probe
-		// rows and they must match a NULL build key, so the NULL slot has to be discovered
-		// and probed by the unique-entries walk below - pre-marking it would silently drop
-		// those matches.
+		// storage dictionaries reserve a NULL sentinel slot that non-NULL probe rows never
+		// reference; pre-mark NULL child slots resolved so resolved_count can still reach dict_size.
+		// Equality joins only: PrepareKeys drops NULL probe rows, so the NULL slot is never probed.
+		// Under NOT DISTINCT FROM those rows are kept and the walk below must probe it itself.
 		if (!null_values_are_equal[0] && dictionary_vector.GetVectorType() == VectorType::FLAT_VECTOR) {
 			const auto &child_validity = FlatVector::Validity(dictionary_vector);
 			if (child_validity.CanHaveNull()) {
@@ -972,8 +968,8 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		                        dict_state.dictionary_id, dict_size, dict_state.capacity);
 	}
 
-	// for each row, append its dict slot to unique_entries the first time we see it
-	// skip the walk once every slot is resolved - no further slot can appear
+	// collect each dict slot once; skip the walk once every slot is resolved, since no
+	// later chunk under the same id can introduce a new one
 	auto &found_entry = dict_state.found_entry;
 	auto &unique_entries = dict_state.unique_entries;
 	idx_t unique_count = 0;
