@@ -246,6 +246,9 @@ public:
 	//! Dictionary-aware variant of Probe. Returns false if the LHS keys are not dictionary-eligible.
 	bool TryProbeDictionary(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
 	                        ProbeState &probe_state);
+	//! Constant-vector variant of Probe. Returns false if the LHS keys are not a constant vector.
+	bool TryProbeConstant(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
+	                      ProbeState &probe_state);
 	//! Scan the HT to construct the full outer join result
 	void ScanFullOuter(JoinHTScanState &state, Vector &addresses, DataChunk &result) const;
 

@@ -1736,6 +1736,11 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
+		} else if (state.dict_probe_enabled &&
+		           state.lhs_join_keys.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR &&
+		           sink.hash_table->TryProbeConstant(state.scan_structure, state.lhs_join_keys, state.join_key_state,
+		                                             state.probe_state)) {
+			// scan_structure populated by the constant-vector fast path
 		} else if (state.dict_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
 		           sink.hash_table->TryProbeDictionary(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 		                                               state.probe_state)) {

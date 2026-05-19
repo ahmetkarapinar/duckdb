@@ -1039,6 +1039,75 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 	return true;
 }
 
+bool JoinHashTable::TryProbeConstant(ScanStructure &scan_structure, DataChunk &keys, TupleDataChunkState &key_state,
+                                     ProbeState &probe_state) {
+	D_ASSERT(equality_types.size() == 1);
+	D_ASSERT(Count() > 0);
+	D_ASSERT(finalized);
+
+	auto &constant_col = keys.data[0];
+	if (constant_col.GetVectorType() != VectorType::CONSTANT_VECTOR) {
+		return false;
+	}
+#ifndef DEBUG
+	if (keys.size() <= 1) {
+		// resolving once only pays off when the result fans out to multiple probe rows
+		return false;
+	}
+#endif
+
+	// resolve the single distinct key once - a constant vector carries no dictionary id, so
+	// there is no per-id cache: every chunk independently does exactly one hash-table lookup
+	auto &dict_state = probe_state.dict_state;
+	auto &unique_values = dict_state.unique_values;
+	if (unique_values.ColumnCount() == 0) {
+		unique_values.InitializeEmpty(vector<LogicalType> {equality_types[0]});
+		TupleDataCollection::InitializeChunkState(dict_state.unique_key_state, {equality_types[0]});
+	}
+	unique_values.data[0].Reference(constant_col);
+	unique_values.SetCardinality(1);
+	unique_values.Flatten();
+
+	TupleDataCollection::ToUnifiedFormat(dict_state.unique_key_state, unique_values);
+
+	auto &hashes = dict_state.hashes;
+	VectorOperations::Hash(unique_values.data[0], hashes, 1);
+
+	// GetRowPointers leaves count at 1 on a hit and 0 on a miss; a NULL constant key resolves
+	// correctly here too, since the RowMatcher honours null_values_are_equal for this join
+	idx_t count = 1;
+	GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
+	               dict_state.new_dictionary_pointers, dict_state.match_sel, false);
+	const auto resolved_ptr =
+	    count == 0 ? nullptr : FlatVector::GetData<data_ptr_t>(dict_state.new_dictionary_pointers)[0];
+
+	// fan out the resolved pointer into the scan_structure shape that Probe() produces
+	scan_structure.is_null = false;
+	scan_structure.finished = false;
+	if (join_type != JoinType::INNER) {
+		memset(scan_structure.found_match.get(), 0, sizeof(bool) * STANDARD_VECTOR_SIZE);
+	}
+	TupleDataCollection::ToUnifiedFormat(key_state, keys);
+	const SelectionVector *current_sel;
+	const idx_t prepared_count =
+	    PrepareKeys(keys, key_state.vector_data, current_sel, scan_structure.sel_vector, false);
+	scan_structure.has_null_value_filter = prepared_count < keys.size();
+
+	auto scan_structure_ptrs = FlatVector::GetDataMutable<data_ptr_t>(scan_structure.pointers);
+	idx_t kept = 0;
+	if (resolved_ptr) {
+		// PrepareKeys already dropped NULL probe rows for equality joins; the rest all share
+		// the one resolved chain-head pointer
+		for (idx_t i = 0; i < prepared_count; i++) {
+			const auto row_index = current_sel->get_index(i);
+			scan_structure_ptrs[row_index] = resolved_ptr;
+			scan_structure.sel_vector.set_index(kept++, row_index);
+		}
+	}
+	scan_structure.count = kept;
+	return true;
+}
+
 ScanStructure::ScanStructure(JoinHashTable &ht_p, TupleDataChunkState &key_state_p)
     : key_state(key_state_p), pointers(LogicalType::POINTER), count(0), sel_vector(STANDARD_VECTOR_SIZE),
       chain_match_sel_vector(STANDARD_VECTOR_SIZE), chain_no_match_sel_vector(STANDARD_VECTOR_SIZE),
