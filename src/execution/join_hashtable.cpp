@@ -948,9 +948,14 @@ bool JoinHashTable::TryProbeDictionary(ScanStructure &scan_structure, DataChunk 
 		dict_state.dictionary_id = dictionary_id;
 		dict_state.resolved_count = 0;
 		// pre-mark NULL child slots as resolved so the gate below can saturate even when
-		// the probe never references the storage-reserved NULL sentinel slot (PrepareKeys
-		// drops NULL probe rows at fan-out time, so their cache entries stay nullptr)
-		if (dictionary_vector.GetVectorType() == VectorType::FLAT_VECTOR) {
+		// the probe never references the storage-reserved NULL sentinel slot. Only safe for
+		// regular equality joins: there PrepareKeys drops NULL probe rows at fan-out time, so
+		// the NULL slot is never probed and its cache entry staying nullptr is harmless. Under
+		// NOT DISTINCT FROM (null_values_are_equal[0] == true) PrepareKeys keeps NULL probe
+		// rows and they must match a NULL build key, so the NULL slot has to be discovered
+		// and probed by the unique-entries walk below - pre-marking it would silently drop
+		// those matches.
+		if (!null_values_are_equal[0] && dictionary_vector.GetVectorType() == VectorType::FLAT_VECTOR) {
 			const auto &child_validity = FlatVector::Validity(dictionary_vector);
 			if (child_validity.CanHaveNull()) {
 				for (idx_t i = 0; i < dict_size; i++) {
