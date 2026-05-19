@@ -1073,8 +1073,9 @@ bool JoinHashTable::TryProbeConstant(ScanStructure &scan_structure, DataChunk &k
 	auto &hashes = dict_state.hashes;
 	VectorOperations::Hash(unique_values.data[0], hashes, 1);
 
-	// GetRowPointers leaves count at 1 on a hit and 0 on a miss; a NULL constant key resolves
-	// correctly here too, since the RowMatcher honours null_values_are_equal for this join
+	// count stays 1 when the key hashes to a non-empty bucket and 0 otherwise; resolved_ptr is a
+	// chain-head, not a confirmed match - a real key-miss is still rejected by the chain walk in
+	// Next(). A NULL constant key also resolves correctly, as RowMatcher honours null equality.
 	idx_t count = 1;
 	GetRowPointers(unique_values, dict_state.unique_key_state, probe_state, hashes, nullptr, count,
 	               dict_state.new_dictionary_pointers, dict_state.match_sel, false);

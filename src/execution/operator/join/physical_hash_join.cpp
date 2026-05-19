@@ -1576,8 +1576,8 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 //===--------------------------------------------------------------------===//
 // Operator
 //===--------------------------------------------------------------------===//
-//! Structural gate for the dictionary-aware probe path; evaluated once per operator state
-static bool CanUseDictionaryProbe(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
+//! Structural gate for the compressed-vector probe paths; evaluated once per operator state
+static bool CanUseCompressedProbe(const HashJoinGlobalSinkState &sink, const vector<JoinCondition> &conditions) {
 	if (sink.external) {
 		// external joins re-finalize the HT mid-probe, invalidating the per-id pointer cache
 		return false;
@@ -1609,6 +1609,11 @@ static bool LHSChunkIsDictionaryEligible(const Vector &lhs_key) {
 	return DictionaryVector::DictionarySize(lhs_key).IsValid();
 }
 
+//! Per-chunk fast-reject so non-constant chunks skip the TryProbeConstant call entirely
+static bool LHSChunkIsConstant(const Vector &lhs_key) {
+	return lhs_key.GetVectorType() == VectorType::CONSTANT_VECTOR;
+}
+
 class HashJoinOperatorState : public CachingOperatorState {
 public:
 	HashJoinOperatorState(ClientContext &context, const PhysicalHashJoin &op_p, HashJoinGlobalSinkState &sink)
@@ -1628,8 +1633,8 @@ public:
 	JoinHashTable::ProbeState probe_state;
 	//! Chunk to sink data into for external join
 	DataChunk spill_chunk;
-	//! Cached result of CanUseDictionaryProbe for this operator state
-	bool dict_probe_enabled = false;
+	//! Cached result of CanUseCompressedProbe for this operator state
+	bool compressed_probe_enabled = false;
 
 public:
 	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override {
@@ -1683,7 +1688,7 @@ unique_ptr<OperatorState> PhysicalHashJoin::GetOperatorState(ExecutionContext &c
 		sink.InitializeProbeSpill();
 	}
 
-	state->dict_probe_enabled = CanUseDictionaryProbe(sink, conditions);
+	state->compressed_probe_enabled = CanUseCompressedProbe(sink, conditions);
 
 	return std::move(state);
 }
@@ -1736,12 +1741,11 @@ OperatorResultType PhysicalHashJoin::ExecuteInternal(ExecutionContext &context, 
 			sink.hash_table->ProbeAndSpill(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 			                               state.probe_state, input, *sink.probe_spill, state.spill_state,
 			                               state.spill_chunk);
-		} else if (state.dict_probe_enabled &&
-		           state.lhs_join_keys.data[0].GetVectorType() == VectorType::CONSTANT_VECTOR &&
+		} else if (state.compressed_probe_enabled && LHSChunkIsConstant(state.lhs_join_keys.data[0]) &&
 		           sink.hash_table->TryProbeConstant(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 		                                             state.probe_state)) {
 			// scan_structure populated by the constant-vector fast path
-		} else if (state.dict_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
+		} else if (state.compressed_probe_enabled && LHSChunkIsDictionaryEligible(state.lhs_join_keys.data[0]) &&
 		           sink.hash_table->TryProbeDictionary(state.scan_structure, state.lhs_join_keys, state.join_key_state,
 		                                               state.probe_state)) {
 			// scan_structure populated by the dictionary-aware path
