@@ -501,15 +501,16 @@ public:
 		auto &gstate = gstate_p.Cast<HashJoinGlobalSinkState>();
 		join_keys.Reset();
 		payload_chunk.Reset();
-		if (hash_table) {
+		if (hash_table && append_state_initialised) {
 			// Only reset layout-dependent state if it was ever published on this thread.
 			// The layout itself survives the iteration — only the row data is dropped.
-			if (append_state_initialised) {
-				hash_table->ResetForNewIterationSinglePartition();
-				hash_table->GetSinkCollection().ResetAppendState(append_state);
-			}
+			hash_table->ResetForNewIterationSinglePartition();
+			hash_table->GetSinkCollection().ResetAppendState(append_state);
 		} else {
-			// The local HT was moved into gstate during Combine; build a fresh one and re-init lazily.
+			// Either the local HT was moved into gstate during Combine, or it exists but no layout
+			// was ever published on it (so its radix_bits are still the initial value, while the
+			// global HT was reset to single-partition). Rebuild from scratch against the current
+			// global radix_bits so partition counts stay consistent in PrepareFinalize.
 			hash_table = op.InitializeHashTable(context.client, gstate.hash_table->GetRadixBits());
 			append_state_initialised = false;
 		}
@@ -532,6 +533,13 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	}
 	// SINGLE joins need FlatVector::SetNull on unmatched rows; dictionary vectors cannot supply it
 	if (ht.join_type == JoinType::SINGLE) {
+		return false;
+	}
+	// LEFT joins may dispatch into NextUniqueLeftJoin (when !chains_longer_than_one), which gathers
+	// payload columns column-by-column through ScanStructure::GatherResult — bypassing the
+	// dict-surviving branch in GatherRHS. A narrowed UINTEGER slot would then be read as the column's
+	// native type and trip the templated-gather type check.
+	if (ht.join_type == JoinType::LEFT) {
 		return false;
 	}
 	if (op.rhs_output_columns.col_types.empty()) {
@@ -1752,6 +1760,13 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// check for possible perfect hash table
 	auto use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
+	// PHJ's FullScanHashTable reads payload columns from the row store at their native width;
+	// if dict-surviving narrowed any payload slot to UINTEGER, that scan would crash. The
+	// CanUseDictSurvivingJoin gate uses the plan-time PHJ check, but runtime min/max from filter
+	// pushdown can flip the decision here, so we also need a runtime fence.
+	if (use_perfect_hash && sink.DictSurvivingActive()) {
+		use_perfect_hash = false;
+	}
 	if (use_perfect_hash) {
 		use_perfect_hash = sink.perfect_join_executor->BuildPerfectHashTable();
 	}
