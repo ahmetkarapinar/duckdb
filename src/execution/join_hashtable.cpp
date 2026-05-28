@@ -83,18 +83,29 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
 	// at least one equality is necessary
 	D_ASSERT(!equality_types.empty());
 
-	// Types for the layout
-	auto layout = make_shared_ptr<TupleDataLayout>();
-	vector<LogicalType> layout_types(condition_types);
-	layout_types.insert(layout_types.end(), build_types.begin(), build_types.end());
-	if (PropagatesBuildSide(join_type)) {
-		// full/right outer joins need an extra bool to keep track of whether or not a tuple has found a matching entry
-		// we place the bool before the NEXT pointer
-		layout_types.emplace_back(LogicalType::BOOLEAN);
+	if (join_type == JoinType::SINGLE) {
+		single_join_error_on_multiple_rows = Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context);
 	}
-	layout_types.emplace_back(LogicalType::HASH);
-	layout->Initialize(layout_types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
-	layout_ptr = std::move(layout);
+
+	if (non_equality_predicates.empty() && !residual_predicate &&
+	    (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK)) {
+		insert_duplicate_keys = false;
+	}
+
+	InitializePartitionMasks();
+	// Layout-dependent state is published lazily on the first Sink chunk (see FinishInitWithLayout).
+}
+
+void JoinHashTable::FinishInitWithLayout(shared_ptr<TupleDataLayout> published_layout,
+                                         vector<bool> dict_surviving_eligible_p) {
+	D_ASSERT(!layout_ptr);
+	layout_ptr = std::move(published_layout);
+	if (dict_surviving_eligible_p.empty()) {
+		dict_surviving_eligible.assign(build_types.size(), false);
+	} else {
+		D_ASSERT(dict_surviving_eligible_p.size() == build_types.size());
+		dict_surviving_eligible = std::move(dict_surviving_eligible_p);
+	}
 
 	// Initialize the row matcher that are used for filtering during the probing only if there are non-equality preds
 	if (!non_equality_predicates.empty()) {
@@ -125,16 +136,8 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
 	dead_end = make_unsafe_uniq_array_uninitialized<data_t>(layout_ptr->GetRowWidth());
 	memset(dead_end.get(), 0, layout_ptr->GetRowWidth());
 
-	if (join_type == JoinType::SINGLE) {
-		single_join_error_on_multiple_rows = Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context);
-	}
-
-	if (non_equality_predicates.empty() && !residual_predicate &&
-	    (join_type == JoinType::SEMI || join_type == JoinType::ANTI || join_type == JoinType::MARK)) {
-		insert_duplicate_keys = false;
-	}
-
-	InitializePartitionMasks();
+	// indexed parallel to build_types / payload columns (not to output_columns)
+	dict_registry.assign(build_types.size(), nullptr);
 }
 
 JoinHashTable::~JoinHashTable() {
@@ -161,6 +164,26 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 	}
 
 	sink_collection->Combine(*other.sink_collection);
+
+	// Reconcile per-column pinned upstream dictionary entries with the other thread's view.
+	// For pipeline-global producers every thread sees the same buffer_ptr, so this is normally a no-op
+	// or a "take theirs" adoption. Different ids across threads would mean row-store codes index into
+	// different child arrays — not recoverable without re-scattering.
+	if (dict_registry.size() < other.dict_registry.size()) {
+		dict_registry.resize(other.dict_registry.size(), nullptr);
+	}
+	for (idx_t col = 0; col < other.dict_registry.size(); col++) {
+		if (!other.dict_registry[col]) {
+			continue;
+		}
+		if (!dict_registry[col]) {
+			dict_registry[col] = std::move(other.dict_registry[col]);
+		} else if (dict_registry[col]->id != other.dict_registry[col]->id) {
+			throw InternalException(
+			    "compressed-materialized join: dictionary id mismatch across threads (column %llu)",
+			    static_cast<unsigned long long>(col));
+		}
+	}
 }
 
 static void ApplyBitmaskAndGetSaltBuild(Vector &hashes_v, Vector &salt_v, const idx_t &bitmask) {
@@ -427,8 +450,36 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 	}
 	idx_t col_offset = keys.ColumnCount();
 	D_ASSERT(build_types.size() == payload.ColumnCount());
+	// Scratch vectors of dictionary sel indices, materialised lazily for dict-surviving columns.
+	// Stored here so the buffers outlive ToUnifiedFormat / AppendUnified below.
+	vector<Vector> dict_idx_vectors;
 	for (idx_t i = 0; i < payload.ColumnCount(); i++) {
-		source_chunk.data[col_offset + i].Reference(payload.data[i]);
+		auto &incoming = payload.data[i];
+		const bool eligible_col = i < dict_surviving_eligible.size() && dict_surviving_eligible[i];
+		if (eligible_col) {
+			// Pipeline-global producers guarantee that every chunk wraps the same DictionaryEntry
+			D_ASSERT(incoming.GetVectorType() == VectorType::DICTIONARY_VECTOR);
+			D_ASSERT(!DictionaryVector::DictionaryId(incoming).empty());
+			D_ASSERT(DictionaryVector::IsPipelineGlobal(incoming));
+			// Pin the upstream entry on the first chunk; assert id continuity on subsequent chunks
+			auto entry_ptr = incoming.BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
+			if (!dict_registry[i]) {
+				dict_registry[i] = entry_ptr;
+			} else {
+				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
+			}
+			// Materialise a flat UINTEGER vector exposing the per-row sel indices into the row store
+			dict_idx_vectors.emplace_back(LogicalType::UINTEGER, payload.size());
+			auto &idx_vec = dict_idx_vectors.back();
+			const auto &dict_sel = DictionaryVector::SelVector(incoming);
+			auto idx_data = FlatVector::GetDataMutable<uint32_t>(idx_vec);
+			for (idx_t r = 0; r < payload.size(); r++) {
+				idx_data[r] = NumericCast<uint32_t>(dict_sel.get_index(r));
+			}
+			source_chunk.data[col_offset + i].Reference(idx_vec);
+		} else {
+			source_chunk.data[col_offset + i].Reference(incoming);
+		}
 	}
 	col_offset += payload.ColumnCount();
 	if (PropagatesBuildSide(join_type)) {
@@ -1438,9 +1489,27 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 		return;
 	}
 	const auto &result_sel = *FlatVector::IncrementalSelectionVector();
+	const auto ptrs = FlatVector::GetData<data_ptr_t>(row_ptrs);
+	const auto &offsets = layout_ptr->GetOffsets();
+	const auto cond_count = condition_types.size();
+
 	for (idx_t col_idx = 0; col_idx < output_columns.size(); col_idx++) {
 		auto &vector = result.data[rhs_col_offset + col_idx];
 		const auto output_col_idx = output_columns[col_idx];
+
+		// dict-surviving column: emit the upstream pipeline-global dictionary directly
+		const idx_t payload_idx = output_col_idx - cond_count;
+		if (payload_idx < dict_registry.size() && dict_registry[payload_idx]) {
+			SelectionVector build_sel_vec(count);
+			const auto col_offset = offsets[output_col_idx];
+			for (idx_t i = 0; i < count; i++) {
+				const auto match_idx = ptr_sel.get_index(i);
+				build_sel_vec.set_index(i, Load<uint32_t>(ptrs[match_idx] + col_offset));
+			}
+			vector.Dictionary(dict_registry[payload_idx], build_sel_vec, count);
+			continue;
+		}
+
 		D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
 		data_collection->Gather(row_ptrs, ptr_sel, count, output_col_idx, vector, result_sel, nullptr);
 		FlatVector::SetSize(vector, count_t(count));
@@ -2178,6 +2247,11 @@ static void ResetCorrelatedMarkJoinInfo(JoinHashTable &ht) {
 }
 
 void JoinHashTable::ResetForNewIterationSinglePartition() {
+	if (!layout_ptr) {
+		// Layout was never published on this HT (no Sink chunk arrived in the previous iteration).
+		// Nothing to reset; the next iteration's first chunk will publish.
+		return;
+	}
 	data_collection->Reset();
 	// Always use a single partition (radix_bits=0) to avoid per-iteration overhead of resetting
 	// and re-creating many radix partitions when only one thread builds the hash table.
@@ -2208,6 +2282,10 @@ void JoinHashTable::ResetForNewIterationSinglePartition() {
 	aux_next_ptrs.Reset();
 	aux_next_ptrs_data = nullptr;
 	use_dict_emission = false;
+	// Drop pinned upstream dictionary entries; the next iteration's first chunk re-pins
+	for (auto &entry : dict_registry) {
+		entry.reset();
+	}
 }
 
 bool JoinHashTable::PrepareExternalFinalize(const idx_t max_ht_size) {
@@ -2401,6 +2479,13 @@ bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool ex
 	if (external) {
 		return false;
 	}
+	// mutually exclusive with the compressed-materialized path: that path narrows the payload slot to 4 bytes,
+	// while NEXT_PTR embedding here overwrites a different field and assumes payload bytes are intact.
+	for (const auto &entry : dict_registry) {
+		if (entry) {
+			return false;
+		}
+	}
 	// SINGLE joins need FlatVector::SetNull for unmatched rows; dictionary vectors cannot supply it
 	if (join_type == JoinType::SINGLE) {
 		return false;
@@ -2472,7 +2557,8 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
 		const auto &type = op.rhs_output_columns.col_types[col_idx];
-		auto dict_entry = DictionaryVector::CreateReusableDictionary(type, build_count);
+		// BuildDictionaryArrays runs once at finalize; the entry it mints is wrapped by every probe-output chunk
+		auto dict_entry = DictionaryVector::CreateReusablePipelineGlobalDictionary(type, build_count);
 		const auto output_col_idx = output_columns[col_idx];
 		collection.Gather(row_pointer_vector, sel, build_count, output_col_idx, dict_entry->data, sel, nullptr);
 		dict_arrays.emplace_back(std::move(dict_entry));

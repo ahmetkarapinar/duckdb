@@ -226,6 +226,13 @@ public:
 	              optional_ptr<Expression> predicate_ptr = nullptr, const vector<idx_t> &output_in_probe = {});
 	~JoinHashTable();
 
+	//! Initialize layout-dependent state from a layout shared across all per-thread JHTs (deferred ctor body)
+	void FinishInitWithLayout(shared_ptr<TupleDataLayout> published_layout, vector<bool> dict_surviving_eligible_p = {});
+	//! True iff FinishInitWithLayout has populated layout-dependent state
+	bool IsLayoutFinalized() const {
+		return layout_ptr.get() != nullptr;
+	}
+
 	//! Add the given data to the HT
 	void Build(PartitionedTupleDataAppendState &append_state, DataChunk &keys, DataChunk &input);
 	//! Merge another HT into this one
@@ -275,10 +282,10 @@ public:
 	}
 
 	idx_t Count() const {
-		return data_collection->Count();
+		return data_collection ? data_collection->Count() : 0;
 	}
 	idx_t SizeInBytes() const {
-		return data_collection->SizeInBytes();
+		return data_collection ? data_collection->SizeInBytes() : 0;
 	}
 
 	PartitionedTupleData &GetSinkCollection() {
@@ -370,6 +377,12 @@ public:
 	bool use_dict_emission = false;
 	//! Pre-materialized columnar data, one entry per RHS output column
 	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
+	//! Per RHS output column: pipeline-global dict entry pinned from the upstream producer.
+	//! A non-null entry signals "row store carries a uint32 dict index for this column".
+	vector<buffer_ptr<DictionaryEntry>> dict_registry;
+	//! Per build payload column: true iff the row-store slot has been narrowed to a uint32 dict index.
+	//! Parallel to build_types; set by FinishInitWithLayout from the published gate decision.
+	vector<bool> dict_surviving_eligible;
 	//! Saved NEXT_PTR values, indexed by dict index; only allocated when chains_longer_than_one
 	AllocatedData aux_next_ptrs;
 	//! Typed pointer into aux_next_ptrs; set by BuildDictionaryArrays alongside the allocation

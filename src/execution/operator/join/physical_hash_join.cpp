@@ -7,6 +7,7 @@
 #include "duckdb/common/types/value_map.hpp"
 #include "duckdb/common/uhugeint.hpp"
 #include "duckdb/common/types/uhugeint.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/join_hashtable.hpp"
 #include "duckdb/execution/operator/aggregate/ungrouped_aggregate_state.hpp"
@@ -293,6 +294,22 @@ unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientC
 	return result;
 }
 
+//! Synchronisation state for the first-chunk publication of the TupleDataLayout.
+//! Carries the per-column decision on whether to narrow the row-store slot to a 4-byte
+//! dictionary index, and the canonical layout that all per-thread JHTs share.
+struct LayoutGate {
+	std::mutex publish_mutex;
+	std::atomic<bool> published {false};
+	shared_ptr<TupleDataLayout> layout_ptr;
+	vector<bool> dict_surviving_eligible;
+
+	void Reset() {
+		published.store(false, std::memory_order_release);
+		layout_ptr.reset();
+		dict_surviving_eligible.clear();
+	}
+};
+
 class HashJoinGlobalSinkState : public GlobalSinkState {
 public:
 	HashJoinGlobalSinkState(const PhysicalHashJoin &op_p, ClientContext &context_p)
@@ -306,6 +323,7 @@ public:
 		// For perfect hash join
 		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
 		auto use_perfect_hash = CanUsePerfectHashJoin(op, *perfect_join_executor);
+		can_use_perfect_hash = use_perfect_hash;
 		// For external hash join
 		external = Settings::Get<DebugForceExternalSetting>(context);
 		// Set probe types
@@ -328,6 +346,11 @@ public:
 
 	void ScheduleFinalize(Pipeline &pipeline, Event &event);
 	void InitializeProbeSpill();
+	//! First-chunk election: build the canonical layout (with per-column 4-byte narrowing) and publish it.
+	//! Idempotent and safe to call concurrently; only the first thread runs the slow path.
+	void PublishLayoutIfFirst(class HashJoinLocalSinkState &lstate, DataChunk &payload_chunk);
+	//! True iff at least one column on the global JHT carries a pinned upstream dictionary entry.
+	bool DictSurvivingActive() const;
 
 	bool SupportsReuse() const override {
 		return true;
@@ -338,6 +361,7 @@ public:
 		hash_table->ResetForNewIterationSinglePartition();
 		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
 		auto use_perfect_hash = CanUsePerfectHashJoin(op, *perfect_join_executor);
+		can_use_perfect_hash = use_perfect_hash;
 		finalized = false;
 		active_local_states = 0;
 		external = Settings::Get<DebugForceExternalSetting>(context);
@@ -360,6 +384,8 @@ public:
 			}
 			global_filter_state = op.filter_pushdown->GetGlobalState(context, op);
 		}
+		// Keep the published layout across CTE iterations (same upstream operator, same arrival types).
+		// ResetForNewIterationSinglePartition already cleared the row data and dict_registry.
 		GlobalSinkState::Reset(context);
 	}
 
@@ -406,6 +432,13 @@ public:
 	bool skip_filter_pushdown = false;
 	unique_ptr<JoinFilterGlobalState> global_filter_state;
 	bool keep_local_hash_tables = false;
+
+	//! Coordinates first-chunk publication of the TupleDataLayout across parallel sinks.
+	LayoutGate layout_gate;
+	//! True iff this join may use the perfect-hash-join code path at Finalize.
+	//! PHJ's FullScanHashTable gathers payload columns at their native width; it is incompatible with
+	//! the dict-surviving row-slot narrowing, so we disable dict-surviving when PHJ is on the table.
+	bool can_use_perfect_hash = false;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -430,7 +463,8 @@ public:
 		}
 
 		hash_table = op.InitializeHashTable(context, gstate.hash_table->GetRadixBits());
-		hash_table->GetSinkCollection().InitializeAppendState(append_state);
+		// The sink_collection is only available once the layout has been published on the first build chunk;
+		// InitializeAppendState therefore runs lazily inside Sink (see PhysicalHashJoin::Sink).
 		keep_hash_table = gstate.keep_local_hash_tables;
 
 		gstate.active_local_states++;
@@ -443,11 +477,15 @@ public:
 public:
 	const PhysicalHashJoin &op;
 	PartitionedTupleDataAppendState append_state;
+	//! True once InitializeAppendState has been called against the published sink_collection
+	bool append_state_initialised = false;
 
 	ExpressionExecutor join_key_executor;
 	DataChunk join_keys;
 
 	DataChunk payload_chunk;
+	//! Scratch chunk holding flat UINTEGER vectors of dictionary sel indices, one per dict-surviving column
+	DataChunk dict_idx_chunk;
 
 	//! Thread-local HT
 	unique_ptr<JoinHashTable> hash_table;
@@ -464,11 +502,17 @@ public:
 		join_keys.Reset();
 		payload_chunk.Reset();
 		if (hash_table) {
-			hash_table->ResetForNewIterationSinglePartition();
+			// Only reset layout-dependent state if it was ever published on this thread.
+			// The layout itself survives the iteration — only the row data is dropped.
+			if (append_state_initialised) {
+				hash_table->ResetForNewIterationSinglePartition();
+				hash_table->GetSinkCollection().ResetAppendState(append_state);
+			}
 		} else {
+			// The local HT was moved into gstate during Combine; build a fresh one and re-init lazily.
 			hash_table = op.InitializeHashTable(context.client, gstate.hash_table->GetRadixBits());
+			append_state_initialised = false;
 		}
-		hash_table->GetSinkCollection().ResetAppendState(append_state);
 		keep_hash_table = gstate.keep_local_hash_tables;
 		gstate.active_local_states++;
 		if (op.filter_pushdown) {
@@ -478,6 +522,127 @@ public:
 		}
 	}
 };
+
+//! Join-level gate (shape-only checks; same conditions as Project 1's dict-emission, plus PHJ exclusion)
+static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTable &ht, bool external,
+                                    bool can_use_perfect_hash) {
+	// external joins rebuild partitions; pinned upstream entries cannot survive the rebuild
+	if (external) {
+		return false;
+	}
+	// SINGLE joins need FlatVector::SetNull on unmatched rows; dictionary vectors cannot supply it
+	if (ht.join_type == JoinType::SINGLE) {
+		return false;
+	}
+	if (op.rhs_output_columns.col_types.empty()) {
+		return false;
+	}
+	// PHJ's FullScanHashTable reads payload columns directly from the row store at native width;
+	// narrowing the slot to a uint32 dict index would corrupt that scan.
+	if (can_use_perfect_hash) {
+		return false;
+	}
+	return true;
+}
+
+//! True iff the residual predicate (if any) reads the column at the given build_types index
+static bool ColumnReferencedByResidual(const JoinHashTable &ht, idx_t build_col_idx) {
+	if (!ht.residual_info) {
+		return false;
+	}
+	const auto layout_col = ht.condition_types.size() + build_col_idx;
+	for (const auto &kv : ht.residual_info->build_input_to_layout_map) {
+		if (kv.second == layout_col) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool HashJoinGlobalSinkState::DictSurvivingActive() const {
+	if (!hash_table) {
+		return false;
+	}
+	for (const auto &entry : hash_table->dict_registry) {
+		if (entry) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstate, DataChunk &payload_chunk) {
+	if (layout_gate.published.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::unique_lock<std::mutex> guard(layout_gate.publish_mutex);
+	if (layout_gate.published.load(std::memory_order_relaxed)) {
+		return;
+	}
+
+	const auto &cond_types = lstate.hash_table->condition_types;
+	const auto &build_types = lstate.hash_table->build_types;
+	layout_gate.dict_surviving_eligible.assign(build_types.size(), false);
+
+	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash)) {
+		for (idx_t col = 0; col < build_types.size(); col++) {
+			const auto &type = build_types[col];
+			// (a) native width strictly greater than 4 bytes (narrow types would regress)
+			if (GetTypeIdSize(type.InternalType()) <= sizeof(uint32_t)) {
+				continue;
+			}
+			// (b) Vector::Dictionary rejects nested types
+			switch (type.InternalType()) {
+			case PhysicalType::STRUCT:
+			case PhysicalType::LIST:
+			case PhysicalType::ARRAY:
+				continue;
+			default:
+				break;
+			}
+			// (c) residual predicates read from the row slot directly; a narrowed slot would corrupt
+			if (ColumnReferencedByResidual(*lstate.hash_table, col)) {
+				continue;
+			}
+			// (d)/(e) the first chunk must actually arrive as a pipeline-global dictionary
+			if (col >= payload_chunk.ColumnCount()) {
+				continue;
+			}
+			auto &incoming = payload_chunk.data[col];
+			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+				continue;
+			}
+			if (!DictionaryVector::IsPipelineGlobal(incoming)) {
+				continue;
+			}
+			layout_gate.dict_surviving_eligible[col] = true;
+		}
+	}
+
+	vector<LogicalType> layout_types(cond_types);
+	for (idx_t col = 0; col < build_types.size(); col++) {
+		if (layout_gate.dict_surviving_eligible[col]) {
+			layout_types.emplace_back(LogicalType::UINTEGER);
+		} else {
+			layout_types.emplace_back(build_types[col]);
+		}
+	}
+	if (PropagatesBuildSide(lstate.hash_table->join_type)) {
+		layout_types.emplace_back(LogicalType::BOOLEAN);
+	}
+	layout_types.emplace_back(LogicalType::HASH);
+
+	auto layout = make_shared_ptr<TupleDataLayout>();
+	layout->Initialize(layout_types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	layout_gate.layout_ptr = layout;
+
+	// global HT receives the same layout so Merge/Combine and finalize-time scans operate against it
+	if (hash_table && !hash_table->IsLayoutFinalized()) {
+		hash_table->FinishInitWithLayout(layout, layout_gate.dict_surviving_eligible);
+	}
+
+	layout_gate.published.store(true, std::memory_order_release);
+}
 
 static bool ShouldPrepareBloomFilterBuild(const PhysicalHashJoin &op) {
 	if (!op.filter_pushdown || op.filter_pushdown->probe_info.empty()) {
@@ -628,6 +793,17 @@ SinkResultType PhysicalHashJoin::Sink(ExecutionContext &context, DataChunk &chun
 		lstate.payload_chunk.ReferenceColumns(chunk, payload_columns.col_idxs);
 	}
 
+	// first-chunk: publish the canonical layout against the actually-arriving vector types
+	gstate.PublishLayoutIfFirst(lstate, lstate.payload_chunk);
+
+	// lazy per-thread setup against the published layout
+	if (!lstate.append_state_initialised) {
+		lstate.hash_table->FinishInitWithLayout(gstate.layout_gate.layout_ptr,
+		                                        gstate.layout_gate.dict_surviving_eligible);
+		lstate.hash_table->GetSinkCollection().InitializeAppendState(lstate.append_state);
+		lstate.append_state_initialised = true;
+	}
+
 	// build the HT
 	lstate.hash_table->Build(lstate.append_state, lstate.join_keys, lstate.payload_chunk);
 
@@ -642,9 +818,16 @@ SinkCombineResultType PhysicalHashJoin::Combine(ExecutionContext &context, Opera
 	auto &gstate = input.global_state.Cast<HashJoinGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<HashJoinLocalSinkState>();
 
-	lstate.hash_table->GetSinkCollection().FlushAppendState(lstate.append_state);
+	// Under deferred layout, a thread that never received a Sink chunk has no sink_collection to flush
+	const bool has_layout = lstate.append_state_initialised;
+	if (has_layout) {
+		lstate.hash_table->GetSinkCollection().FlushAppendState(lstate.append_state);
+	}
 	annotated_lock_guard<annotated_mutex> guard(gstate.lock);
-	if (lstate.keep_hash_table) {
+	if (!has_layout) {
+		// nothing to merge — drop the empty thread-local hash table
+		gstate.active_local_states--;
+	} else if (lstate.keep_hash_table) {
 		gstate.local_hash_tables.push_back(*lstate.hash_table);
 	} else {
 		gstate.owned_local_hash_tables.push_back(std::move(lstate.hash_table));
@@ -736,6 +919,29 @@ static idx_t GetPartitioningSpaceRequirement(ClientContext &context, const vecto
 
 void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &global_state) const {
 	auto &gstate = global_state.Cast<HashJoinGlobalSinkState>();
+	// If no Sink chunk ever arrived, the layout was never published. Fall back to a default layout
+	// (all columns at their native width) so finalize-time scans can dereference data_collection.
+	if (!gstate.layout_gate.published.load(std::memory_order_acquire)) {
+		std::unique_lock<std::mutex> guard(gstate.layout_gate.publish_mutex);
+		if (!gstate.layout_gate.published.load(std::memory_order_relaxed)) {
+			const auto &cond_types = gstate.hash_table->condition_types;
+			const auto &build_types = gstate.hash_table->build_types;
+			gstate.layout_gate.dict_surviving_eligible.assign(build_types.size(), false);
+			vector<LogicalType> layout_types(cond_types);
+			layout_types.insert(layout_types.end(), build_types.begin(), build_types.end());
+			if (PropagatesBuildSide(gstate.hash_table->join_type)) {
+				layout_types.emplace_back(LogicalType::BOOLEAN);
+			}
+			layout_types.emplace_back(LogicalType::HASH);
+			auto layout = make_shared_ptr<TupleDataLayout>();
+			layout->Initialize(layout_types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+			gstate.layout_gate.layout_ptr = layout;
+			if (!gstate.hash_table->IsLayoutFinalized()) {
+				gstate.hash_table->FinishInitWithLayout(layout);
+			}
+			gstate.layout_gate.published.store(true, std::memory_order_release);
+		}
+	}
 	const auto &ht = *gstate.hash_table;
 
 	gstate.total_size =
