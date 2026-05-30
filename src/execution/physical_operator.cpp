@@ -1,4 +1,5 @@
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/common/vector/dictionary_vector.hpp"
 #include "duckdb/function/table_function.hpp"
 
 #include "duckdb/common/printer.hpp"
@@ -346,6 +347,20 @@ static CachingPhysicalOperatorExecuteMode SelectExecutionMode(const DataChunk &c
                                                               ClientContext &client_context) {
 	if (state.can_cache_chunk == OperatorCachingMode::NONE) {
 		return CachingPhysicalOperatorExecuteMode::RETURN_CHUNK;
+	}
+	// Caching flattens its input (DataChunk::Append resolves dictionaries), which would discard a
+	// pipeline-global DictionaryEntry that a downstream consumer relies on staying intact across chunks.
+	// Pass such chunks through instead, flushing any pending cache first to preserve row order.
+	if (chunk.size() > 0) {
+		for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
+			if (!DictionaryVector::IsPipelineGlobal(chunk.data[col_idx])) {
+				continue;
+			}
+			if (state.cached_chunk && state.cached_chunk->size() > 0) {
+				return CachingPhysicalOperatorExecuteMode::RETURN_CACHED_THEN_CHUNK_VIA_CONTINUATION;
+			}
+			return CachingPhysicalOperatorExecuteMode::RETURN_CHUNK;
+		}
 	}
 	const bool needs_continuation_chunk = (state.can_cache_chunk == OperatorCachingMode::PARTITIONED &&
 	                                       child_result != OperatorResultType::HAVE_MORE_OUTPUT) ||
