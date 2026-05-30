@@ -461,10 +461,22 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			D_ASSERT(incoming.GetVectorType() == VectorType::DICTIONARY_VECTOR);
 			D_ASSERT(!DictionaryVector::DictionaryId(incoming).empty());
 			D_ASSERT(DictionaryVector::IsPipelineGlobal(incoming));
-			// Pin the upstream entry on the first chunk; assert id continuity on subsequent chunks
+			// Pin the dictionary on the first chunk; assert id continuity on subsequent chunks
 			auto entry_ptr = incoming.BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
 			if (!dict_registry[i]) {
-				dict_registry[i] = entry_ptr;
+				// The upstream child is filled by a zero-copy gather, so its long strings still point
+				// into the producer's row-store heap, which is recycled before we gather on the probe
+				// side. Pin a self-owned deep copy so the child outlives the producer (its heap is
+				// re-rooted into the copy's own StringVectorBuffer), preserving id and pipeline_global.
+				const auto &upstream_child = entry_ptr->data;
+				const auto child_count = upstream_child.size();
+				auto owned_entry =
+				    DictionaryVector::CreateReusablePipelineGlobalDictionary(upstream_child.GetType(), child_count);
+				if (child_count > 0) {
+					VectorOperations::Copy(upstream_child, owned_entry->data, child_count, 0, 0);
+				}
+				owned_entry->id = entry_ptr->id;
+				dict_registry[i] = std::move(owned_entry);
 			} else {
 				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
