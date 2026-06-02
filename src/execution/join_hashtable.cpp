@@ -97,14 +97,14 @@ JoinHashTable::JoinHashTable(ClientContext &context_p, const PhysicalOperator &o
 }
 
 void JoinHashTable::FinishInitWithLayout(shared_ptr<TupleDataLayout> published_layout,
-                                         vector<bool> dict_surviving_eligible_p) {
+                                         vector<uint8_t> dict_index_width_p) {
 	D_ASSERT(!layout_ptr);
 	layout_ptr = std::move(published_layout);
-	if (dict_surviving_eligible_p.empty()) {
-		dict_surviving_eligible.assign(build_types.size(), false);
+	if (dict_index_width_p.empty()) {
+		dict_index_width.assign(build_types.size(), 0);
 	} else {
-		D_ASSERT(dict_surviving_eligible_p.size() == build_types.size());
-		dict_surviving_eligible = std::move(dict_surviving_eligible_p);
+		D_ASSERT(dict_index_width_p.size() == build_types.size());
+		dict_index_width = std::move(dict_index_width_p);
 	}
 
 	// Initialize the row matcher that are used for filtering during the probing only if there are non-equality preds
@@ -179,9 +179,8 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 		if (!dict_registry[col]) {
 			dict_registry[col] = std::move(other.dict_registry[col]);
 		} else if (dict_registry[col]->id != other.dict_registry[col]->id) {
-			throw InternalException(
-			    "compressed-materialized join: dictionary id mismatch across threads (column %llu)",
-			    static_cast<unsigned long long>(col));
+			throw InternalException("compressed-materialized join: dictionary id mismatch across threads (column %llu)",
+			                        static_cast<unsigned long long>(col));
 		}
 	}
 }
@@ -455,8 +454,8 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 	vector<Vector> dict_idx_vectors;
 	for (idx_t i = 0; i < payload.ColumnCount(); i++) {
 		auto &incoming = payload.data[i];
-		const bool eligible_col = i < dict_surviving_eligible.size() && dict_surviving_eligible[i];
-		if (eligible_col) {
+		const uint8_t index_width = i < dict_index_width.size() ? dict_index_width[i] : 0;
+		if (index_width != 0) {
 			// Pipeline-global producers guarantee that every chunk wraps the same DictionaryEntry
 			D_ASSERT(incoming.GetVectorType() == VectorType::DICTIONARY_VECTOR);
 			D_ASSERT(!DictionaryVector::DictionaryId(incoming).empty());
@@ -480,15 +479,37 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			} else {
 				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
-			// Materialise a flat UINTEGER vector exposing the per-row sel indices into the row store
-			dict_idx_vectors.emplace_back(LogicalType::UINTEGER, payload.size());
-			auto &idx_vec = dict_idx_vectors.back();
+			// Materialise a flat unsigned-integer vector of the chosen width exposing the per-row sel
+			// indices into the row store. NumericCast adds a debug overflow assert if an index ever
+			// exceeds the width derived from the dictionary size.
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
-			auto idx_data = FlatVector::GetDataMutable<uint32_t>(idx_vec);
-			for (idx_t r = 0; r < payload.size(); r++) {
-				idx_data[r] = NumericCast<uint32_t>(dict_sel.get_index(r));
+			switch (index_width) {
+			case sizeof(uint8_t): {
+				dict_idx_vectors.emplace_back(LogicalType::UTINYINT, payload.size());
+				auto idx_data = FlatVector::GetDataMutable<uint8_t>(dict_idx_vectors.back());
+				for (idx_t r = 0; r < payload.size(); r++) {
+					idx_data[r] = NumericCast<uint8_t>(dict_sel.get_index(r));
+				}
+				break;
 			}
-			source_chunk.data[col_offset + i].Reference(idx_vec);
+			case sizeof(uint16_t): {
+				dict_idx_vectors.emplace_back(LogicalType::USMALLINT, payload.size());
+				auto idx_data = FlatVector::GetDataMutable<uint16_t>(dict_idx_vectors.back());
+				for (idx_t r = 0; r < payload.size(); r++) {
+					idx_data[r] = NumericCast<uint16_t>(dict_sel.get_index(r));
+				}
+				break;
+			}
+			default: {
+				dict_idx_vectors.emplace_back(LogicalType::UINTEGER, payload.size());
+				auto idx_data = FlatVector::GetDataMutable<uint32_t>(dict_idx_vectors.back());
+				for (idx_t r = 0; r < payload.size(); r++) {
+					idx_data[r] = NumericCast<uint32_t>(dict_sel.get_index(r));
+				}
+				break;
+			}
+			}
+			source_chunk.data[col_offset + i].Reference(dict_idx_vectors.back());
 		} else {
 			source_chunk.data[col_offset + i].Reference(incoming);
 		}
@@ -1514,9 +1535,24 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 		if (payload_idx < dict_registry.size() && dict_registry[payload_idx]) {
 			SelectionVector build_sel_vec(count);
 			const auto col_offset = offsets[output_col_idx];
-			for (idx_t i = 0; i < count; i++) {
-				const auto match_idx = ptr_sel.get_index(i);
-				build_sel_vec.set_index(i, Load<uint32_t>(ptrs[match_idx] + col_offset));
+			// Read the dict index at the width chosen for this column at layout-publication time
+			const uint8_t index_width = payload_idx < dict_index_width.size() ? dict_index_width[payload_idx] : 0;
+			switch (index_width) {
+			case sizeof(uint8_t):
+				for (idx_t i = 0; i < count; i++) {
+					build_sel_vec.set_index(i, Load<uint8_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+				}
+				break;
+			case sizeof(uint16_t):
+				for (idx_t i = 0; i < count; i++) {
+					build_sel_vec.set_index(i, Load<uint16_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+				}
+				break;
+			default:
+				for (idx_t i = 0; i < count; i++) {
+					build_sel_vec.set_index(i, Load<uint32_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+				}
+				break;
 			}
 			vector.Dictionary(dict_registry[payload_idx], build_sel_vec, count);
 			continue;

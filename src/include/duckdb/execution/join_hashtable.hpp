@@ -227,7 +227,7 @@ public:
 	~JoinHashTable();
 
 	//! Initialize layout-dependent state from a layout shared across all per-thread JHTs (deferred ctor body)
-	void FinishInitWithLayout(shared_ptr<TupleDataLayout> published_layout, vector<bool> dict_surviving_eligible_p = {});
+	void FinishInitWithLayout(shared_ptr<TupleDataLayout> published_layout, vector<uint8_t> dict_index_width_p = {});
 	//! True iff FinishInitWithLayout has populated layout-dependent state
 	bool IsLayoutFinalized() const {
 		return layout_ptr.get() != nullptr;
@@ -380,9 +380,9 @@ public:
 	//! Per RHS output column: pipeline-global dict entry pinned from the upstream producer.
 	//! A non-null entry signals "row store carries a uint32 dict index for this column".
 	vector<buffer_ptr<DictionaryEntry>> dict_registry;
-	//! Per build payload column: true iff the row-store slot has been narrowed to a uint32 dict index.
+	//! Per build payload column: byte width of the narrowed dict-index slot (0 = not narrowed, else 1/2/4).
 	//! Parallel to build_types; set by FinishInitWithLayout from the published gate decision.
-	vector<bool> dict_surviving_eligible;
+	vector<uint8_t> dict_index_width;
 	//! Saved NEXT_PTR values, indexed by dict index; only allocated when chains_longer_than_one
 	AllocatedData aux_next_ptrs;
 	//! Typed pointer into aux_next_ptrs; set by BuildDictionaryArrays alongside the allocation

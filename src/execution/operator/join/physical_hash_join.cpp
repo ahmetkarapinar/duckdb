@@ -301,12 +301,12 @@ struct LayoutGate {
 	std::mutex publish_mutex;
 	std::atomic<bool> published {false};
 	shared_ptr<TupleDataLayout> layout_ptr;
-	vector<bool> dict_surviving_eligible;
+	vector<uint8_t> dict_index_width;
 
 	void Reset() {
 		published.store(false, std::memory_order_release);
 		layout_ptr.reset();
-		dict_surviving_eligible.clear();
+		dict_index_width.clear();
 	}
 };
 
@@ -524,6 +524,33 @@ public:
 	}
 };
 
+// A dictionary of D slots uses indices 0..D-1, so D slots address into a width of W bytes iff D <= 2^(8*W).
+static constexpr idx_t DICT_INDEX_UINT8_CAPACITY = 256;    // 2^8  values fit in a uint8
+static constexpr idx_t DICT_INDEX_UINT16_CAPACITY = 65536; // 2^16 values fit in a uint16
+
+//! Narrowest unsigned-integer byte width that can hold any index into a dictionary of dict_size slots
+static uint8_t DictIndexWidth(idx_t dict_size) {
+	if (dict_size <= DICT_INDEX_UINT8_CAPACITY) {
+		return sizeof(uint8_t);
+	}
+	if (dict_size <= DICT_INDEX_UINT16_CAPACITY) {
+		return sizeof(uint16_t);
+	}
+	return sizeof(uint32_t);
+}
+
+//! Row-store slot type for a dict index of the given byte width
+static LogicalType DictIndexType(uint8_t index_width) {
+	switch (index_width) {
+	case sizeof(uint8_t):
+		return LogicalType::UTINYINT;
+	case sizeof(uint16_t):
+		return LogicalType::USMALLINT;
+	default:
+		return LogicalType::UINTEGER;
+	}
+}
+
 //! Join-level gate (shape-only checks; same conditions as Project 1's dict-emission, plus PHJ exclusion)
 static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTable &ht, bool external,
                                     bool can_use_perfect_hash) {
@@ -590,16 +617,12 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 
 	const auto &cond_types = lstate.hash_table->condition_types;
 	const auto &build_types = lstate.hash_table->build_types;
-	layout_gate.dict_surviving_eligible.assign(build_types.size(), false);
+	layout_gate.dict_index_width.assign(build_types.size(), 0);
 
 	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash)) {
 		for (idx_t col = 0; col < build_types.size(); col++) {
 			const auto &type = build_types[col];
-			// (a) native width strictly greater than 4 bytes (narrow types would regress)
-			if (GetTypeIdSize(type.InternalType()) <= sizeof(uint32_t)) {
-				continue;
-			}
-			// (b) Vector::Dictionary rejects nested types
+			// (a) Vector::Dictionary rejects nested types
 			switch (type.InternalType()) {
 			case PhysicalType::STRUCT:
 			case PhysicalType::LIST:
@@ -608,11 +631,11 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 			default:
 				break;
 			}
-			// (c) residual predicates read from the row slot directly; a narrowed slot would corrupt
+			// (b) residual predicates read from the row slot directly; a narrowed slot would corrupt
 			if (ColumnReferencedByResidual(*lstate.hash_table, col)) {
 				continue;
 			}
-			// (d)/(e) the first chunk must actually arrive as a pipeline-global dictionary
+			// (c)/(d) the first chunk must actually arrive as a pipeline-global dictionary
 			if (col >= payload_chunk.ColumnCount()) {
 				continue;
 			}
@@ -623,14 +646,27 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 			if (!DictionaryVector::IsPipelineGlobal(incoming)) {
 				continue;
 			}
-			layout_gate.dict_surviving_eligible[col] = true;
+			// (e) choose the index width from the dictionary size; an empty dictionary keeps native width
+			const auto dict_size = DictionaryVector::DictionarySize(incoming);
+			if (!dict_size.IsValid()) {
+				continue;
+			}
+			// (f) only narrow when the index is strictly smaller than the native slot (never regress).
+			// This generalises the old "native > 4 bytes" gate: a 4-byte INTEGER over a D <= 256
+			// dictionary now narrows to 1 byte, where the fixed-uint32 rule would have rejected it.
+			const uint8_t index_width = DictIndexWidth(dict_size.GetIndex());
+			const auto native_bytes = GetTypeIdSize(type.InternalType());
+			if (index_width >= native_bytes) {
+				continue;
+			}
+			layout_gate.dict_index_width[col] = index_width;
 		}
 	}
 
 	vector<LogicalType> layout_types(cond_types);
 	for (idx_t col = 0; col < build_types.size(); col++) {
-		if (layout_gate.dict_surviving_eligible[col]) {
-			layout_types.emplace_back(LogicalType::UINTEGER);
+		if (layout_gate.dict_index_width[col] != 0) {
+			layout_types.emplace_back(DictIndexType(layout_gate.dict_index_width[col]));
 		} else {
 			layout_types.emplace_back(build_types[col]);
 		}
@@ -646,7 +682,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 
 	// global HT receives the same layout so Merge/Combine and finalize-time scans operate against it
 	if (hash_table && !hash_table->IsLayoutFinalized()) {
-		hash_table->FinishInitWithLayout(layout, layout_gate.dict_surviving_eligible);
+		hash_table->FinishInitWithLayout(layout, layout_gate.dict_index_width);
 	}
 
 	layout_gate.published.store(true, std::memory_order_release);
@@ -806,8 +842,7 @@ SinkResultType PhysicalHashJoin::Sink(ExecutionContext &context, DataChunk &chun
 
 	// lazy per-thread setup against the published layout
 	if (!lstate.append_state_initialised) {
-		lstate.hash_table->FinishInitWithLayout(gstate.layout_gate.layout_ptr,
-		                                        gstate.layout_gate.dict_surviving_eligible);
+		lstate.hash_table->FinishInitWithLayout(gstate.layout_gate.layout_ptr, gstate.layout_gate.dict_index_width);
 		lstate.hash_table->GetSinkCollection().InitializeAppendState(lstate.append_state);
 		lstate.append_state_initialised = true;
 	}
@@ -934,7 +969,7 @@ void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &
 		if (!gstate.layout_gate.published.load(std::memory_order_relaxed)) {
 			const auto &cond_types = gstate.hash_table->condition_types;
 			const auto &build_types = gstate.hash_table->build_types;
-			gstate.layout_gate.dict_surviving_eligible.assign(build_types.size(), false);
+			gstate.layout_gate.dict_index_width.assign(build_types.size(), 0);
 			vector<LogicalType> layout_types(cond_types);
 			layout_types.insert(layout_types.end(), build_types.begin(), build_types.end());
 			if (PropagatesBuildSide(gstate.hash_table->join_type)) {
