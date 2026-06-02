@@ -1559,6 +1559,11 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 		}
 
 		D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
+		// The native gather writes straight into a flat buffer. A reused output chunk (e.g. across recursive-CTE
+		// iterations) may still hold a DICTIONARY_VECTOR left by a prior dict-emitting iteration; reset it to flat.
+		if (vector.GetVectorType() != VectorType::FLAT_VECTOR) {
+			vector.Initialize();
+		}
 		data_collection->Gather(row_ptrs, ptr_sel, count, output_col_idx, vector, result_sel, nullptr);
 		FlatVector::SetSize(vector, count_t(count));
 	}
@@ -2601,12 +2606,19 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	(void)collected;
 	const auto row_ptrs = FlatVector::GetData<data_ptr_t>(row_pointer_vector);
 
+	// LEFT / OUTER joins fill unmatched probe rows with a constant-NULL vector (ScanStructure::NextLeftJoin),
+	// so they do not wrap this entry on every output chunk -- it is only pipeline-global when every chunk
+	// goes through EmitDictVectors (INNER / RIGHT / RIGHT_SEMI / RIGHT_ANTI).
+	const bool dict_on_every_chunk = join_type != JoinType::LEFT && join_type != JoinType::OUTER;
+
 	// gather RHS output columns into columnar dictionary arrays
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
 		const auto &type = op.rhs_output_columns.col_types[col_idx];
 		// BuildDictionaryArrays runs once at finalize; the entry it mints is wrapped by every probe-output chunk
-		auto dict_entry = DictionaryVector::CreateReusablePipelineGlobalDictionary(type, build_count);
+		auto dict_entry = dict_on_every_chunk
+		                      ? DictionaryVector::CreateReusablePipelineGlobalDictionary(type, build_count)
+		                      : DictionaryVector::CreateReusableDictionary(type, build_count);
 		const auto output_col_idx = output_columns[col_idx];
 		collection.Gather(row_pointer_vector, sel, build_count, output_col_idx, dict_entry->data, sel, nullptr);
 		dict_arrays.emplace_back(std::move(dict_entry));
