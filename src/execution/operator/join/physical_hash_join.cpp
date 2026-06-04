@@ -294,6 +294,25 @@ unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientC
 	return result;
 }
 
+//! True iff the build subtree contains an operator that funnels multiple producer pipelines into one
+//! sink (UNION ALL, recursive CTE). The publisher elects the layout on the first build chunk under a
+//! per-producer contract; a multi-source build can deliver a later chunk flat or as a different
+//! dictionary under the already-narrowed slot, which the scatter pre-pass cannot recover from.
+//! Conservative full-subtree walk (mirrors ContainsSink in physical_union.cpp): it never misses a
+//! union, at the cost of over-excluding a union shielded by an intervening materialising sink.
+static bool BuildSideHasMultipleSources(const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::UNION || op.type == PhysicalOperatorType::RECURSIVE_CTE ||
+	    op.type == PhysicalOperatorType::RECURSIVE_KEY_CTE) {
+		return true;
+	}
+	for (const auto &child : op.children) {
+		if (BuildSideHasMultipleSources(child.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Synchronisation state for the first-chunk publication of the TupleDataLayout.
 //! Carries the per-column decision on whether to narrow the row-store slot to a 4-byte
 //! dictionary index, and the canonical layout that all per-thread JHTs share.
@@ -324,6 +343,9 @@ public:
 		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
 		auto use_perfect_hash = CanUsePerfectHashJoin(op, *perfect_join_executor);
 		can_use_perfect_hash = use_perfect_hash;
+		// A UNION ALL / recursive CTE on the build side feeds the sink from multiple producers (computed
+		// once from the static plan; it cannot change at runtime), disqualifying dict-surviving.
+		build_side_multi_source = BuildSideHasMultipleSources(op.children[1].get());
 		// For external hash join
 		external = Settings::Get<DebugForceExternalSetting>(context);
 		// Set probe types
@@ -439,6 +461,9 @@ public:
 	//! PHJ's FullScanHashTable gathers payload columns at their native width; it is incompatible with
 	//! the dict-surviving row-slot narrowing, so we disable dict-surviving when PHJ is on the table.
 	bool can_use_perfect_hash = false;
+	//! True iff the build subtree funnels multiple producer pipelines into this sink (UNION ALL /
+	//! recursive CTE); disables dict-surviving because the first-chunk layout election is unsound there.
+	bool build_side_multi_source = false;
 };
 
 unique_ptr<JoinFilterLocalState> JoinFilterPushdownInfo::GetLocalState(JoinFilterGlobalState &gstate) const {
@@ -553,9 +578,16 @@ static LogicalType DictIndexType(uint8_t index_width) {
 
 //! Join-level gate (shape-only checks; same conditions as Project 1's dict-emission, plus PHJ exclusion)
 static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTable &ht, bool external,
-                                    bool can_use_perfect_hash) {
+                                    bool can_use_perfect_hash, bool build_side_multi_source) {
 	// external joins rebuild partitions; pinned upstream entries cannot survive the rebuild
 	if (external) {
+		return false;
+	}
+	// A build pipeline fed by UNION ALL (or a recursive CTE) has multiple source operators. The
+	// publisher's "decide the layout once on the first chunk" contract is per-producer, not
+	// per-pipeline, so a later branch may arrive flat or as a different dictionary under the already-
+	// narrowed slot. Disqualify the whole join rather than narrow any column.
+	if (build_side_multi_source) {
 		return false;
 	}
 	// SINGLE joins need FlatVector::SetNull on unmatched rows; dictionary vectors cannot supply it
@@ -625,7 +657,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	const auto &build_types = lstate.hash_table->build_types;
 	layout_gate.dict_index_width.assign(build_types.size(), 0);
 
-	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash)) {
+	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash, build_side_multi_source)) {
 		for (idx_t col = 0; col < build_types.size(); col++) {
 			const auto &type = build_types[col];
 			// (a) Vector::Dictionary rejects nested types

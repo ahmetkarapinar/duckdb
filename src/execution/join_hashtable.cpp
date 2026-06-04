@@ -456,11 +456,19 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 		auto &incoming = payload.data[i];
 		const uint8_t index_width = i < dict_index_width.size() ? dict_index_width[i] : 0;
 		if (index_width != 0) {
-			// Pipeline-global producers guarantee that every chunk wraps the same DictionaryEntry
-			D_ASSERT(incoming.GetVectorType() == VectorType::DICTIONARY_VECTOR);
-			D_ASSERT(!DictionaryVector::DictionaryId(incoming).empty());
-			D_ASSERT(DictionaryVector::IsPipelineGlobal(incoming));
-			// Pin the dictionary on the first chunk; assert id continuity on subsequent chunks
+			// Defence in depth: the publisher narrowed this column's slot on the first chunk under the
+			// pipeline-global contract, which the B-gate enforces is single-source. If a later chunk
+			// still arrives non-dict or as a different dictionary, narrowing has already committed the
+			// slot width and prior chunks are scattered — there is no in-place fallback, so throw
+			// rather than read foreign bytes as sel indices (silent row-store corruption in release).
+			// Short-circuits so DictionaryId/IsPipelineGlobal are never called on a non-dict vector.
+			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
+			    DictionaryVector::DictionaryId(incoming).empty() || !DictionaryVector::IsPipelineGlobal(incoming)) {
+				throw InternalException("compressed-materialized join: narrowed column %llu received a "
+				                        "non-pipeline-global chunk; build pipeline is not single-source",
+				                        static_cast<unsigned long long>(i));
+			}
+			// Pin the dictionary on the first chunk; enforce id continuity on subsequent chunks
 			auto entry_ptr = incoming.BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
 			if (!dict_registry[i]) {
 				// The upstream child is filled by a zero-copy gather, so its long strings still point
@@ -476,8 +484,10 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				}
 				owned_entry->id = entry_ptr->id;
 				dict_registry[i] = std::move(owned_entry);
-			} else {
-				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
+			} else if (dict_registry[i]->id != entry_ptr->id) {
+				throw InternalException("compressed-materialized join: narrowed column %llu received a chunk "
+				                        "with a different dictionary id; build pipeline is not single-source",
+				                        static_cast<unsigned long long>(i));
 			}
 			// Materialise a flat unsigned-integer vector of the chosen width exposing the per-row sel
 			// indices into the row store. NumericCast adds a debug overflow assert if an index ever
