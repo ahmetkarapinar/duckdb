@@ -569,6 +569,12 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	if (ht.join_type == JoinType::LEFT) {
 		return false;
 	}
+	// OUTER joins fill unmatched-probe rows with a constant-NULL vector (ScanStructure::NextLeftJoin), so their
+	// output stream mixes pipeline-global dict chunks (matched rows via GatherRHS) with CONSTANT_NULL fill chunks.
+	// Admitting OUTER would re-emit a falsely pipeline-global dictionary that a downstream consumer cannot trust.
+	if (ht.join_type == JoinType::OUTER) {
+		return false;
+	}
 	if (op.rhs_output_columns.col_types.empty()) {
 		return false;
 	}
