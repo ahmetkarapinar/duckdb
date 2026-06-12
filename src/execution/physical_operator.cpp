@@ -425,9 +425,9 @@ static bool ChunkHasPipelineGlobalDict(const DataChunk &chunk) {
 	return false;
 }
 
-//! Switch the (empty) cache to State B for every pipeline-global dict column: pin the upstream
-//! entry, allocate its sel accumulator, and rebuild the flat cache with a placeholder slot for
-//! each such column so State A and State B columns stay row-aligned.
+//! Switch the (empty) cache to dictionary mode for every pipeline-global dict column: pin the
+//! upstream entry, allocate its sel accumulator, and rebuild the flat cache with a placeholder slot
+//! for each such column so dict and flat columns stay row-aligned.
 static void SeedDictCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
 	const idx_t col_count = source.ColumnCount();
 	state.dict_columns.clear();
@@ -442,15 +442,15 @@ static void SeedDictCache(CachingOperatorState &state, DataChunk &source, Client
 		slot.accumulated_sel.Initialize(STANDARD_VECTOR_SIZE);
 		flat_initialize[col_idx] = false;
 	}
-	// State B columns become zero-width placeholders in cached_chunk; the dict lives in the accumulator
+	// dict columns become zero-width placeholders in cached_chunk; the dict lives in the accumulator
 	state.cached_chunk->Destroy();
 	state.cached_chunk->Initialize(Allocator::Get(client_context), source.GetTypes(), flat_initialize);
 	state.dict_cache_active = true;
 }
 
 //! Append source into the cache. Lazily creates it, and on the first append into an empty cache
-//! decides the per-column State A/State B tags. State A columns flat-append as before; State B
-//! columns concatenate their dictionary selection indices.
+//! detects pipeline-global dict columns. Flat columns append as before; dict columns concatenate
+//! their selection indices instead of flattening.
 static void AppendToCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
 	if (!state.cached_chunk) {
 		state.cached_chunk = make_uniq<DataChunk>();
@@ -461,7 +461,7 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 		SeedDictCache(state, source, client_context);
 	}
 	if (!state.dict_cache_active) {
-		// State A only: identical to the previous behaviour
+		// no dict columns: identical to the previous behaviour
 		cache.Append(source);
 		return;
 	}
@@ -470,8 +470,8 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
 		auto &slot = state.dict_columns[col_idx];
 		if (slot.entry) {
-			// State B: this column must still be the same pipeline-global entry. Guaranteed for the
-			// two qualifying producers; the asserts catch a producer that breaks the invariant
+			// dict column: must still be the same pipeline-global entry (guaranteed for the two
+			// qualifying producers; the asserts catch a producer that breaks the invariant)
 			D_ASSERT(DictionaryVector::IsPipelineGlobal(source.data[col_idx]));
 			D_ASSERT(source.data[col_idx].Buffer().Cast<DictionaryBuffer>().GetEntry().id == slot.entry->id);
 			const auto &source_sel = DictionaryVector::SelVector(source.data[col_idx]);
@@ -479,7 +479,7 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 				slot.accumulated_sel.set_index(base + row, source_sel.get_index(row));
 			}
 		} else {
-			// State A: flat-append exactly like DataChunk::Append does per column
+			// flat column: append exactly like DataChunk::Append does per column
 			FlatVector::SetSize(cache.data[col_idx], base);
 			cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);
 		}
@@ -487,7 +487,7 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 	cache.SetCardinality(base + added);
 }
 
-//! After moving the cache into chunk, re-wrap each State B column as a DICTIONARY_VECTOR over the
+//! After moving the cache into chunk, re-wrap each dict column as a DICTIONARY_VECTOR over the
 //! pinned upstream entry, carrying its id and pipeline_global flag through unchanged.
 static void RewrapDictColumns(CachingOperatorState &state, DataChunk &chunk, idx_t count) {
 	for (idx_t col_idx = 0; col_idx < chunk.ColumnCount(); col_idx++) {
@@ -499,8 +499,8 @@ static void RewrapDictColumns(CachingOperatorState &state, DataChunk &chunk, idx
 	}
 }
 
-//! Move the cache into chunk (reconstructing State B columns) and re-initialize an empty flat
-//! cache for the next batch. With no State B columns this is byte-identical to the previous flush.
+//! Move the cache into chunk (reconstructing dict columns) and re-initialize an empty flat cache
+//! for the next batch. With no dict columns this is byte-identical to the previous flush.
 static void FlushCacheToChunk(CachingOperatorState &state, DataChunk &chunk, ClientContext &client_context) {
 	if (!state.dict_cache_active) {
 		chunk.Move(*state.cached_chunk);

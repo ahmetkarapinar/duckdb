@@ -377,8 +377,8 @@ public:
 	bool use_dict_emission = false;
 	//! Pre-materialized columnar data, one entry per RHS output column
 	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
-	//! Per RHS output column: pipeline-global dict entry pinned from the upstream producer.
-	//! A non-null entry signals "row store carries a uint32 dict index for this column".
+	//! Per build payload column: dict entry pinned from the upstream producer. A non-null entry means
+	//! the row store carries a narrow dict index for this column instead of the native value.
 	vector<buffer_ptr<DictionaryEntry>> dict_registry;
 	//! Per build payload column: byte width of the narrowed dict-index slot (0 = not narrowed, else 1/2/4).
 	//! Parallel to build_types; set by FinishInitWithLayout from the published gate decision.

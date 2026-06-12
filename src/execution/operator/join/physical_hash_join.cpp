@@ -294,12 +294,9 @@ unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientC
 	return result;
 }
 
-//! True iff the build subtree contains an operator that funnels multiple producer pipelines into one
-//! sink (UNION ALL, recursive CTE). The publisher elects the layout on the first build chunk under a
-//! per-producer contract; a multi-source build can deliver a later chunk flat or as a different
-//! dictionary under the already-narrowed slot, which the scatter pre-pass cannot recover from.
-//! Conservative full-subtree walk (mirrors ContainsSink in physical_union.cpp): it never misses a
-//! union, at the cost of over-excluding a union shielded by an intervening materialising sink.
+//! True iff the build subtree funnels multiple producer pipelines into one sink (UNION ALL, recursive
+//! CTE), which breaks the publisher's "decide the layout once on the first chunk" contract. Conservative
+//! full-subtree walk: never misses a union, may over-exclude one shielded by a materialising sink.
 static bool BuildSideHasMultipleSources(const PhysicalOperator &op) {
 	if (op.type == PhysicalOperatorType::UNION || op.type == PhysicalOperatorType::RECURSIVE_CTE ||
 	    op.type == PhysicalOperatorType::RECURSIVE_KEY_CTE) {
@@ -313,9 +310,8 @@ static bool BuildSideHasMultipleSources(const PhysicalOperator &op) {
 	return false;
 }
 
-//! Synchronisation state for the first-chunk publication of the TupleDataLayout.
-//! Carries the per-column decision on whether to narrow the row-store slot to a 4-byte
-//! dictionary index, and the canonical layout that all per-thread JHTs share.
+//! Synchronisation state for the first-chunk publication of the TupleDataLayout: the canonical layout
+//! shared by all per-thread JHTs, plus the per-column decision on whether to narrow the row-store slot.
 struct LayoutGate {
 	std::mutex publish_mutex;
 	std::atomic<bool> published {false};
@@ -368,7 +364,7 @@ public:
 
 	void ScheduleFinalize(Pipeline &pipeline, Event &event);
 	void InitializeProbeSpill();
-	//! First-chunk election: build the canonical layout (with per-column 4-byte narrowing) and publish it.
+	//! First-chunk election: build the canonical layout (with per-column slot narrowing) and publish it.
 	//! Idempotent and safe to call concurrently; only the first thread runs the slow path.
 	void PublishLayoutIfFirst(class HashJoinLocalSinkState &lstate, DataChunk &payload_chunk);
 	//! True iff at least one column on the global JHT carries a pinned upstream dictionary entry.
@@ -581,10 +577,8 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	if (external) {
 		return false;
 	}
-	// A build pipeline fed by UNION ALL (or a recursive CTE) has multiple source operators. The
-	// publisher's "decide the layout once on the first chunk" contract is per-producer, not
-	// per-pipeline, so a later branch may arrive flat or as a different dictionary under the already-
-	// narrowed slot. Disqualify the whole join rather than narrow any column.
+	// a multi-source build can deliver a later chunk flat or as a different dictionary under the
+	// already-narrowed slot, so disqualify the whole join (see BuildSideHasMultipleSources)
 	if (build_side_multi_source) {
 		return false;
 	}
@@ -594,8 +588,8 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	}
 	// LEFT joins may dispatch into NextUniqueLeftJoin (when !chains_longer_than_one), which gathers
 	// payload columns column-by-column through ScanStructure::GatherResult — bypassing the
-	// dict-surviving branch in GatherRHS. A narrowed UINTEGER slot would then be read as the column's
-	// native type and trip the templated-gather type check.
+	// dict-surviving branch in GatherRHS. A narrowed slot would then be read as the column's native
+	// type and trip the templated-gather type check.
 	if (ht.join_type == JoinType::LEFT) {
 		return false;
 	}
@@ -609,7 +603,7 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 		return false;
 	}
 	// PHJ's FullScanHashTable reads payload columns directly from the row store at native width;
-	// narrowing the slot to a uint32 dict index would corrupt that scan.
+	// a narrowed dict-index slot would corrupt that scan.
 	if (can_use_perfect_hash) {
 		return false;
 	}
@@ -658,7 +652,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash, build_side_multi_source)) {
 		for (idx_t col = 0; col < build_types.size(); col++) {
 			const auto &type = build_types[col];
-			// (a) Vector::Dictionary rejects nested types
+			// Vector::Dictionary rejects nested types
 			switch (type.InternalType()) {
 			case PhysicalType::STRUCT:
 			case PhysicalType::LIST:
@@ -667,11 +661,11 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 			default:
 				break;
 			}
-			// (b) residual predicates read from the row slot directly; a narrowed slot would corrupt
+			// residual predicates read from the row slot directly; a narrowed slot would corrupt them
 			if (ColumnReferencedByResidual(*lstate.hash_table, col)) {
 				continue;
 			}
-			// (c)/(d) the first chunk must actually arrive as a pipeline-global dictionary
+			// the first chunk must actually arrive as a pipeline-global dictionary
 			if (col >= payload_chunk.ColumnCount()) {
 				continue;
 			}
@@ -682,14 +676,13 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 			if (!DictionaryVector::IsPipelineGlobal(incoming)) {
 				continue;
 			}
-			// (e) choose the index width from the dictionary size; an empty dictionary keeps native width
+			// choose the index width from the dictionary size; an empty dictionary keeps native width
 			const auto dict_size = DictionaryVector::DictionarySize(incoming);
 			if (!dict_size.IsValid()) {
 				continue;
 			}
-			// (f) only narrow when the index is strictly smaller than the native slot (never regress).
-			// This generalises the old "native > 4 bytes" gate: a 4-byte INTEGER over a D <= 256
-			// dictionary now narrows to 1 byte, where the fixed-uint32 rule would have rejected it.
+			// only narrow when the index is strictly smaller than the native slot (never regress); this
+			// also admits e.g. a 4-byte INTEGER over a D <= 256 dictionary, narrowing it to 1 byte
 			const uint8_t index_width = DictIndexWidth(dict_size.GetIndex());
 			const auto native_bytes = GetTypeIdSize(type.InternalType());
 			if (index_width >= native_bytes) {
@@ -1831,10 +1824,9 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// check for possible perfect hash table
 	auto use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
-	// PHJ's FullScanHashTable reads payload columns from the row store at their native width;
-	// if dict-surviving narrowed any payload slot to UINTEGER, that scan would crash. The
-	// CanUseDictSurvivingJoin gate uses the plan-time PHJ check, but runtime min/max from filter
-	// pushdown can flip the decision here, so we also need a runtime fence.
+	// PHJ's FullScanHashTable reads payload columns at their native width; if dict-surviving narrowed
+	// any slot that scan would crash. The plan-time gate can be flipped back here by runtime min/max
+	// from filter pushdown, so re-check at Finalize.
 	if (use_perfect_hash && sink.DictSurvivingActive()) {
 		use_perfect_hash = false;
 	}

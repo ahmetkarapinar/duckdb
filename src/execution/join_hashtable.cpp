@@ -178,10 +178,8 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 		if (!dict_registry[col]) {
 			dict_registry[col] = std::move(other.dict_registry[col]);
 		} else {
-			// Both threads pinned the same pipeline-global entry (one per producer instance, shared across
-			// every thread) so their ids match by construction; the B-gate excludes the multi-source builds
-			// that could break this. A mismatch would be a programmer error in a future producer, never
-			// reachable from user input, so assert rather than throw.
+			// Both threads pinned the same upstream entry, so ids match by construction. A mismatch would
+			// be a producer bug (never user-triggerable), so assert rather than throw.
 			D_ASSERT(dict_registry[col]->id == other.dict_registry[col]->id);
 		}
 	}
@@ -458,14 +456,10 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 		auto &incoming = payload.data[i];
 		const uint8_t index_width = i < dict_index_width.size() ? dict_index_width[i] : 0;
 		if (index_width != 0) {
-			// Defence in depth: the publisher narrowed this column's slot on the first chunk under the
-			// pipeline-global contract, which the B-gate enforces is single-source. If a later chunk still
-			// arrives non-dict or as a different dictionary, narrowing has already committed the slot width
-			// and prior chunks are scattered — there is no in-place fallback. A D_ASSERT is insufficient
-			// here: it compiles out in release, where the Cast<DictionaryBuffer> below would be undefined
-			// behaviour on a non-dict vector and foreign bytes would be scattered as sel indices (silent
-			// row-store corruption). So this stays a release-active throw. The condition short-circuits so
-			// DictionaryId/IsPipelineGlobal are never evaluated on a non-dict vector.
+			// The slot was already narrowed on the first chunk, so there is no fallback if a later chunk
+			// arrives non-dict. This must throw rather than D_ASSERT: in release the Cast<DictionaryBuffer>
+			// below would be undefined behaviour on a non-dict vector, silently scattering foreign bytes as
+			// indices. The check short-circuits so the dict accessors never run on a non-dict vector.
 			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(incoming).empty() || !DictionaryVector::IsPipelineGlobal(incoming)) {
 				throw InternalException("dict-surviving join: narrowed column %llu received a "
@@ -489,15 +483,13 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				owned_entry->id = entry_ptr->id;
 				dict_registry[i] = std::move(owned_entry);
 			} else {
-				// Subsequent chunks of a pipeline-global column wrap the same entry minted once upstream, so
-				// the incoming id matches the pinned copy by construction (the B-gate excludes multi-source
-				// builds). A mismatch is a producer bug, never user-triggerable, so assert rather than throw.
+				// Subsequent chunks wrap the same upstream entry, so the id matches by construction. A
+				// mismatch is a producer bug (never user-triggerable), so assert rather than throw.
 				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
-			// Materialise a flat unsigned-integer vector of the chosen width exposing the per-row sel
-			// indices into the row store. Each index is < D <= the width's capacity by construction (the
-			// publisher picked the width from the dictionary size), so UnsafeNumericCast — a plain
-			// static_cast with no per-row bounds check — is safe on this per-build-row hot path.
+			// Materialise a flat unsigned-int vector of the chosen width holding the per-row sel indices.
+			// Each index fits the width by construction (the publisher chose it from the dictionary size),
+			// so UnsafeNumericCast skips the per-row bounds check on this hot path.
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
 			switch (index_width) {
 			case sizeof(uint8_t): {

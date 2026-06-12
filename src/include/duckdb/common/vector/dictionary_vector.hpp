@@ -22,16 +22,11 @@ public:
 	Vector data;
 	//! Optional id to uniquely identify re-occurring dictionaries
 	string id;
-	//! Survival invariant for the dict-surviving hash join: true iff the producer guarantees this same
-	//! entry is wrapped by *every* output chunk for the lifetime of the operator instance, with a stable
-	//! id and no flat/per-row-group fall-through. Set only by the two qualifying producers via
-	//! DictionaryVector::CreateReusablePipelineGlobalDictionary (Perfect Hash Join and Project 1's
-	//! BuildDictionaryArrays for inner-join-family types); defaults false for storage/Parquet dictionaries
-	//! and dict-aware projection caches, which rotate. It lives on DictionaryEntry — the one object shared
-	//! by every slice/reference/re-emission of the dictionary — so (like id) it survives unchanged from the
-	//! producer to the consuming sink. The sink reads it (DictionaryVector::IsPipelineGlobal) before
-	//! narrowing a row-store slot, which guarantees the same entry/id arrives on every build chunk and on
-	//! every thread, so the stored narrow indices stay valid and the entry can be re-emitted at probe time.
+	//! True iff the producer guarantees this same entry is wrapped by every output chunk for the
+	//! operator's lifetime (stable id, no flat fall-through). Set only by the qualifying producers via
+	//! CreateReusablePipelineGlobalDictionary; the dict-surviving hash join relies on it to narrow a
+	//! row-store slot and re-emit the dictionary at probe time. Lives here, alongside id, because the
+	//! entry is the one object shared by every slice/reference/re-emission of the dictionary.
 	bool pipeline_global = false;
 	//! For caching the hashes of a child buffer (mutable: cache is logically const)
 	mutable mutex cached_hashes_lock;

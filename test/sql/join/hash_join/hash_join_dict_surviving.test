@@ -5,10 +5,8 @@
 # description: in the row store and re-emitted as a DICTIONARY_VECTOR at probe time.
 # group: [hash_join]
 
-# Force multi-threaded execution for every query below. verify_parallelism makes operators run with
-# multiple threads even on small inputs, so the build side is split across several thread-local hash
-# tables that each pin a dict_registry entry and then reconcile through JoinHashTable::Merge -- the
-# single riskiest dimension of this concurrency-heavy feature (the cross-thread dictionary merge).
+# verify_parallelism forces multi-threaded execution even on small inputs, so the build side splits
+# across thread-local hash tables that each pin a dictionary and reconcile through JoinHashTable::Merge.
 statement ok
 PRAGMA threads=4
 
@@ -54,8 +52,7 @@ NATION_2	1600
 NATION_3	1600
 NATION_4	1600
 
-# 1b. Variable-width index over an INTEGER payload: native 4 bytes, D=25 -> narrows to a 1-byte
-# index (a column the old fixed-uint32 gate would have rejected as break-even).
+# 1b. Variable-width index over an INTEGER payload: native 4 bytes, D=25 -> narrows to a 1-byte index.
 query II
 SELECT n.n_region, COUNT(*) AS cnt
 FROM nation n JOIN customer c ON n.nk = c.nk JOIN orders o ON o.ck = c.ck
@@ -131,9 +128,9 @@ statement ok
 SET disabled_optimizers='join_order'
 
 # ----------------------------------------------------------------------------------------------------
-# 4. CachingPhysicalOperator State B (C-1 fix): a tiny build (<= the cache threshold) forces the
-# pipeline-global dict chunks through the caching operator, which must coalesce them WITHOUT
-# flattening (otherwise the downstream sink keys row indices into the wrong dictionary).
+# 4. CachingPhysicalOperator: a tiny build (<= the cache threshold) forces the pipeline-global dict
+# chunks through the caching operator, which must coalesce them without flattening (otherwise the
+# downstream sink keys row indices into the wrong dictionary).
 # ----------------------------------------------------------------------------------------------------
 statement ok
 CREATE TABLE customer_tiny AS SELECT i * 100000 AS ck, i % 25 AS nk FROM range(50) t(i)
@@ -263,7 +260,7 @@ NATION_4	1520
 
 # 8c. NULL values in the dictionary payload plus dictionary NULL slots: nation_gap leaves gaps in the
 # integer key range (so the Perfect Hash Join dictionary child has NULL slots) and a NULL n_name. The
-# self-owned dictionary child must preserve those NULLs 1:1 (this is the Q5-regression territory).
+# self-owned dictionary child must preserve those NULLs 1:1.
 statement ok
 CREATE TABLE nation_gap (nk INTEGER, n_name VARCHAR)
 
@@ -288,9 +285,9 @@ B	1144
 C	1140
 
 # ----------------------------------------------------------------------------------------------------
-# 9. UNION ALL on the build side (B-gate): a build pipeline fed by UNION ALL has multiple source
-# operators, so the publisher's "decide once on the first chunk" contract is unsound. The whole join
-# is disqualified rather than narrow a slot a later branch could arrive flat under.
+# 9. UNION ALL on the build side: a build pipeline fed by UNION ALL has multiple source operators, so
+# the publisher's "decide once on the first chunk" contract is unsound. The whole join is disqualified
+# rather than narrow a slot a later branch could arrive flat under.
 # ----------------------------------------------------------------------------------------------------
 statement ok
 CREATE TABLE other_flat AS SELECT i * 1000 + 500 AS ck, 'FLAT_' || (i % 5) AS n_name FROM range(2000) t(i)

@@ -247,9 +247,9 @@ public:
 	}
 };
 
-//! State B of the cache's tagged union: a pipeline-global dictionary column is not flattened
-//! into cached_chunk. Instead the pinned upstream entry is kept and the per-chunk selection
-//! indices are concatenated, so the dictionary (and its pipeline_global flag) survives the cache.
+//! A cached column that arrived as a pipeline-global dictionary: instead of flattening into
+//! cached_chunk, the pinned upstream entry is kept and the per-chunk selection indices are
+//! concatenated, so the dictionary (and its pipeline_global flag) survives the cache.
 struct CachedDictColumn {
 	buffer_ptr<DictionaryEntry> entry;
 	SelectionVector accumulated_sel;
@@ -273,7 +273,7 @@ public:
 		ResetDictCache();
 	}
 
-	//! Drop the State B accumulators, returning the cache to all-flat (State A) mode
+	//! Drop the dictionary accumulators, returning the cache to plain flat caching
 	void ResetDictCache() {
 		dict_columns.clear();
 		dict_cache_active = false;
@@ -286,8 +286,8 @@ public:
 	bool must_return_continuation_chunk = false;
 	OperatorResultType cached_result;
 
-	//! State B accumulators, one slot per cached column. A column is State B iff its entry is set;
-	//! all-empty (the common case) means the cache is entirely State A and behaves exactly as before.
+	//! One slot per cached column; a column accumulates a dictionary iff its entry is set. All-empty
+	//! (the common case) means the cache is plain flat caching and behaves exactly as before.
 	vector<CachedDictColumn> dict_columns;
 	bool dict_cache_active = false;
 };
