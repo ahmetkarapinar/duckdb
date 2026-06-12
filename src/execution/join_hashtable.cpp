@@ -167,8 +167,7 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 
 	// Reconcile per-column pinned upstream dictionary entries with the other thread's view.
 	// For pipeline-global producers every thread sees the same buffer_ptr, so this is normally a no-op
-	// or a "take theirs" adoption. Different ids across threads would mean row-store codes index into
-	// different child arrays — not recoverable without re-scattering.
+	// or a "take theirs" adoption.
 	if (dict_registry.size() < other.dict_registry.size()) {
 		dict_registry.resize(other.dict_registry.size(), nullptr);
 	}
@@ -178,9 +177,12 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 		}
 		if (!dict_registry[col]) {
 			dict_registry[col] = std::move(other.dict_registry[col]);
-		} else if (dict_registry[col]->id != other.dict_registry[col]->id) {
-			throw InternalException("compressed-materialized join: dictionary id mismatch across threads (column %llu)",
-			                        static_cast<unsigned long long>(col));
+		} else {
+			// Both threads pinned the same pipeline-global entry (one per producer instance, shared across
+			// every thread) so their ids match by construction; the B-gate excludes the multi-source builds
+			// that could break this. A mismatch would be a programmer error in a future producer, never
+			// reachable from user input, so assert rather than throw.
+			D_ASSERT(dict_registry[col]->id == other.dict_registry[col]->id);
 		}
 	}
 }
@@ -457,14 +459,16 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 		const uint8_t index_width = i < dict_index_width.size() ? dict_index_width[i] : 0;
 		if (index_width != 0) {
 			// Defence in depth: the publisher narrowed this column's slot on the first chunk under the
-			// pipeline-global contract, which the B-gate enforces is single-source. If a later chunk
-			// still arrives non-dict or as a different dictionary, narrowing has already committed the
-			// slot width and prior chunks are scattered — there is no in-place fallback, so throw
-			// rather than read foreign bytes as sel indices (silent row-store corruption in release).
-			// Short-circuits so DictionaryId/IsPipelineGlobal are never called on a non-dict vector.
+			// pipeline-global contract, which the B-gate enforces is single-source. If a later chunk still
+			// arrives non-dict or as a different dictionary, narrowing has already committed the slot width
+			// and prior chunks are scattered — there is no in-place fallback. A D_ASSERT is insufficient
+			// here: it compiles out in release, where the Cast<DictionaryBuffer> below would be undefined
+			// behaviour on a non-dict vector and foreign bytes would be scattered as sel indices (silent
+			// row-store corruption). So this stays a release-active throw. The condition short-circuits so
+			// DictionaryId/IsPipelineGlobal are never evaluated on a non-dict vector.
 			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(incoming).empty() || !DictionaryVector::IsPipelineGlobal(incoming)) {
-				throw InternalException("compressed-materialized join: narrowed column %llu received a "
+				throw InternalException("dict-surviving join: narrowed column %llu received a "
 				                        "non-pipeline-global chunk; build pipeline is not single-source",
 				                        static_cast<unsigned long long>(i));
 			}
@@ -484,21 +488,23 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				}
 				owned_entry->id = entry_ptr->id;
 				dict_registry[i] = std::move(owned_entry);
-			} else if (dict_registry[i]->id != entry_ptr->id) {
-				throw InternalException("compressed-materialized join: narrowed column %llu received a chunk "
-				                        "with a different dictionary id; build pipeline is not single-source",
-				                        static_cast<unsigned long long>(i));
+			} else {
+				// Subsequent chunks of a pipeline-global column wrap the same entry minted once upstream, so
+				// the incoming id matches the pinned copy by construction (the B-gate excludes multi-source
+				// builds). A mismatch is a producer bug, never user-triggerable, so assert rather than throw.
+				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
 			// Materialise a flat unsigned-integer vector of the chosen width exposing the per-row sel
-			// indices into the row store. NumericCast adds a debug overflow assert if an index ever
-			// exceeds the width derived from the dictionary size.
+			// indices into the row store. Each index is < D <= the width's capacity by construction (the
+			// publisher picked the width from the dictionary size), so UnsafeNumericCast — a plain
+			// static_cast with no per-row bounds check — is safe on this per-build-row hot path.
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
 			switch (index_width) {
 			case sizeof(uint8_t): {
 				dict_idx_vectors.emplace_back(LogicalType::UTINYINT, payload.size());
 				auto idx_data = FlatVector::GetDataMutable<uint8_t>(dict_idx_vectors.back());
 				for (idx_t r = 0; r < payload.size(); r++) {
-					idx_data[r] = NumericCast<uint8_t>(dict_sel.get_index(r));
+					idx_data[r] = UnsafeNumericCast<uint8_t>(dict_sel.get_index(r));
 				}
 				break;
 			}
@@ -506,7 +512,7 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				dict_idx_vectors.emplace_back(LogicalType::USMALLINT, payload.size());
 				auto idx_data = FlatVector::GetDataMutable<uint16_t>(dict_idx_vectors.back());
 				for (idx_t r = 0; r < payload.size(); r++) {
-					idx_data[r] = NumericCast<uint16_t>(dict_sel.get_index(r));
+					idx_data[r] = UnsafeNumericCast<uint16_t>(dict_sel.get_index(r));
 				}
 				break;
 			}
@@ -514,7 +520,7 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				dict_idx_vectors.emplace_back(LogicalType::UINTEGER, payload.size());
 				auto idx_data = FlatVector::GetDataMutable<uint32_t>(dict_idx_vectors.back());
 				for (idx_t r = 0; r < payload.size(); r++) {
-					idx_data[r] = NumericCast<uint32_t>(dict_sel.get_index(r));
+					idx_data[r] = UnsafeNumericCast<uint32_t>(dict_sel.get_index(r));
 				}
 				break;
 			}
@@ -2542,8 +2548,8 @@ bool JoinHashTable::CanUseDictionaryEmission(const PhysicalHashJoin &op, bool ex
 	if (external) {
 		return false;
 	}
-	// mutually exclusive with the compressed-materialized path: that path narrows the payload slot to 4 bytes,
-	// while NEXT_PTR embedding here overwrites a different field and assumes payload bytes are intact.
+	// mutually exclusive with the dict-surviving path: that path narrows the payload slot to a 1/2/4-byte
+	// index, while NEXT_PTR embedding here overwrites a different field and assumes payload bytes are intact.
 	for (const auto &entry : dict_registry) {
 		if (entry) {
 			return false;

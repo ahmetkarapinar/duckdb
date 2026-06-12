@@ -509,8 +509,6 @@ public:
 	DataChunk join_keys;
 
 	DataChunk payload_chunk;
-	//! Scratch chunk holding flat UINTEGER vectors of dictionary sel indices, one per dict-surviving column
-	DataChunk dict_idx_chunk;
 
 	//! Thread-local HT
 	unique_ptr<JoinHashTable> hash_table;

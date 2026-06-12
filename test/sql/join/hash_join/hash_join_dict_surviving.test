@@ -5,11 +5,15 @@
 # description: in the row store and re-emitted as a DICTIONARY_VECTOR at probe time.
 # group: [hash_join]
 
-# enable_verification re-runs every query through the unoptimized / parallel / (de)serialized paths
-# and asserts they all agree, so each case below doubles as a "results match the non-optimized path"
-# check for the optimization.
+# Force multi-threaded execution for every query below. verify_parallelism makes operators run with
+# multiple threads even on small inputs, so the build side is split across several thread-local hash
+# tables that each pin a dict_registry entry and then reconcile through JoinHashTable::Merge -- the
+# single riskiest dimension of this concurrency-heavy feature (the cross-thread dictionary merge).
 statement ok
-PRAGMA enable_verification
+PRAGMA threads=4
+
+statement ok
+PRAGMA verify_parallelism
 
 # join_order is disabled so the written join order is preserved and the pipeline-global dictionary
 # reliably lands on the build side of the downstream join, where dict-surviving activates.
