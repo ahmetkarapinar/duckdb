@@ -470,12 +470,10 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
 		auto &slot = state.dict_columns[col_idx];
 		if (slot.entry) {
-			// dict column: the slot was seeded from a pipeline-global entry, so every subsequent chunk for
-			// this column must arrive as the same pipeline-global dictionary. Mirror the join sink's Build
-			// pre-pass: a release-active throw (not a D_ASSERT) before the unchecked Cast<DictionaryBuffer>
-			// below, because in release that cast on a non-dict vector is undefined behaviour that would
-			// accumulate foreign bytes as selection indices. The check short-circuits so the dict accessors
-			// never run on a non-dict vector.
+			// dict column: every subsequent chunk must arrive as the same pipeline-global dictionary. Like
+			// the join sink's Build pre-pass, throw (not D_ASSERT) before the unchecked Cast<DictionaryBuffer>
+			// below: in release that cast on a non-dict vector is UB that would accumulate foreign bytes as
+			// selection indices.
 			auto &source_col = source.data[col_idx];
 			if (source_col.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(source_col).empty() || !DictionaryVector::IsPipelineGlobal(source_col)) {
@@ -492,9 +490,8 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 			}
 		} else {
 			// flat column: append exactly like DataChunk::Append does per column. A State-B column is a
-			// zero-width placeholder in cached_chunk, so it must never reach this flat Append; assert the
-			// column is genuinely flat (no pinned entry) to catch a future refactor that decouples the
-			// branch condition above from the append.
+			// zero-width placeholder and must never reach this flat Append, so assert it has no pinned entry
+			// to catch a future refactor that decouples the branch condition above from the append.
 			D_ASSERT(!slot.entry);
 			FlatVector::SetSize(cache.data[col_idx], base);
 			cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);

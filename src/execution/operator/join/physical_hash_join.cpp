@@ -453,9 +453,8 @@ public:
 
 	//! Coordinates first-chunk publication of the TupleDataLayout across parallel sinks.
 	LayoutGate layout_gate;
-	//! True iff this join may use the perfect-hash-join code path at Finalize.
-	//! PHJ's FullScanHashTable gathers payload columns at their native width; it is incompatible with
-	//! the dict-surviving row-slot narrowing, so we disable dict-surviving when PHJ is on the table.
+	//! True iff this join may use perfect-hash-join at Finalize. PHJ's FullScanHashTable reads payload
+	//! columns at native width, incompatible with dict-surviving slot narrowing, so it disables dict-surviving
 	bool can_use_perfect_hash = false;
 	//! True iff the build subtree funnels multiple producer pipelines into this sink (UNION ALL /
 	//! recursive CTE); disables dict-surviving because the first-chunk layout election is unsound there.
@@ -521,15 +520,13 @@ public:
 		join_keys.Reset();
 		payload_chunk.Reset();
 		if (hash_table && append_state_initialised) {
-			// Only reset layout-dependent state if it was ever published on this thread.
-			// The layout itself survives the iteration — only the row data is dropped.
+			// the layout survives the iteration; only the row data is dropped
 			hash_table->ResetForNewIterationSinglePartition();
 			hash_table->GetSinkCollection().ResetAppendState(append_state);
 		} else {
-			// Either the local HT was moved into gstate during Combine, or it exists but no layout
-			// was ever published on it (so its radix_bits are still the initial value, while the
-			// global HT was reset to single-partition). Rebuild from scratch against the current
-			// global radix_bits so partition counts stay consistent in PrepareFinalize.
+			// Either the local HT was moved into gstate during Combine, or it exists but never had a layout
+			// published (so its radix_bits are stale while the global HT reset to single-partition). Rebuild
+			// against the current global radix_bits so partition counts stay consistent in PrepareFinalize.
 			hash_table = op.InitializeHashTable(context.client, gstate.hash_table->GetRadixBits());
 			append_state_initialised = false;
 		}
@@ -586,10 +583,9 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	if (ht.join_type == JoinType::SINGLE) {
 		return false;
 	}
-	// LEFT joins may dispatch into NextUniqueLeftJoin (when !chains_longer_than_one), which gathers
-	// payload columns column-by-column through ScanStructure::GatherResult — bypassing the
-	// dict-surviving branch in GatherRHS. A narrowed slot would then be read as the column's native
-	// type and trip the templated-gather type check.
+	// LEFT joins may dispatch into NextUniqueLeftJoin (when !chains_longer_than_one), which gathers payload
+	// columns through ScanStructure::GatherResult, bypassing GatherRHS' dict-surviving branch; the narrowed
+	// slot would then be read as the native type and trip the templated-gather type check.
 	if (ht.join_type == JoinType::LEFT) {
 		return false;
 	}

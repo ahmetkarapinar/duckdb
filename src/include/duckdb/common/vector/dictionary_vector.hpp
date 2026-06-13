@@ -22,11 +22,8 @@ public:
 	Vector data;
 	//! Optional id to uniquely identify re-occurring dictionaries
 	string id;
-	//! True iff the producer guarantees this same entry is wrapped by every output chunk for the
-	//! operator's lifetime (stable id, no flat fall-through). Set only by the qualifying producers via
-	//! CreateReusablePipelineGlobalDictionary; the dict-surviving hash join relies on it to narrow a
-	//! row-store slot and re-emit the dictionary at probe time. Lives here, alongside id, because the
-	//! entry is the one object shared by every slice/reference/re-emission of the dictionary.
+	//! True iff the producer wraps this same entry in every output chunk for its lifetime (stable id, no
+	//! flat fall-through). Set only via CreateReusablePipelineGlobalDictionary; read by the dict-surviving join
 	bool pipeline_global = false;
 	//! For caching the hashes of a child buffer (mutable: cache is logically const)
 	mutable mutex cached_hashes_lock;

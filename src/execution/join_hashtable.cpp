@@ -165,9 +165,8 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 
 	sink_collection->Combine(*other.sink_collection);
 
-	// Reconcile per-column pinned upstream dictionary entries with the other thread's view.
-	// For pipeline-global producers every thread sees the same buffer_ptr, so this is normally a no-op
-	// or a "take theirs" adoption.
+	// Reconcile per-column pinned dictionary entries. For pipeline-global producers every thread pins the
+	// same buffer_ptr, so this is normally a no-op or a "take theirs" adoption.
 	if (dict_registry.size() < other.dict_registry.size()) {
 		dict_registry.resize(other.dict_registry.size(), nullptr);
 	}
@@ -456,10 +455,9 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 		auto &incoming = payload.data[i];
 		const uint8_t index_width = i < dict_index_width.size() ? dict_index_width[i] : 0;
 		if (index_width != 0) {
-			// The slot was already narrowed on the first chunk, so there is no fallback if a later chunk
-			// arrives non-dict. This must throw rather than D_ASSERT: in release the Cast<DictionaryBuffer>
-			// below would be undefined behaviour on a non-dict vector, silently scattering foreign bytes as
-			// indices. The check short-circuits so the dict accessors never run on a non-dict vector.
+			// The slot was narrowed on the first chunk, so there is no fallback if a later chunk arrives
+			// non-dict. Throw rather than D_ASSERT: in release the Cast<DictionaryBuffer> below is undefined
+			// behaviour on a non-dict vector, silently scattering foreign bytes as indices.
 			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(incoming).empty() || !DictionaryVector::IsPipelineGlobal(incoming)) {
 				throw InternalException("dict-surviving join: narrowed column %llu received a "
@@ -469,10 +467,9 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			// Pin the dictionary on the first chunk; enforce id continuity on subsequent chunks
 			auto entry_ptr = incoming.BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
 			if (!dict_registry[i]) {
-				// The upstream child is filled by a zero-copy gather, so its long strings still point
-				// into the producer's row-store heap, which is recycled before we gather on the probe
-				// side. Pin a self-owned deep copy so the child outlives the producer (its heap is
-				// re-rooted into the copy's own StringVectorBuffer), preserving id and pipeline_global.
+				// The upstream child is filled by a zero-copy gather, so its long strings still point into
+				// the producer's row-store heap, which is recycled before we gather on the probe side. Pin a
+				// self-owned deep copy so the child outlives the producer, preserving id and pipeline_global.
 				const auto &upstream_child = entry_ptr->data;
 				const auto child_count = upstream_child.size();
 				auto owned_entry =
@@ -487,9 +484,9 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				// mismatch is a producer bug (never user-triggerable), so assert rather than throw.
 				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
-			// Materialise a flat unsigned-int vector of the chosen width holding the per-row sel indices.
-			// Each index fits the width by construction (the publisher chose it from the dictionary size),
-			// so UnsafeNumericCast skips the per-row bounds check on this hot path.
+			// Materialise a flat unsigned-int vector of the chosen width. Each index fits the width by
+			// construction (the publisher chose it from the dictionary size), so UnsafeNumericCast skips
+			// the per-row bounds check.
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
 			switch (index_width) {
 			case sizeof(uint8_t): {
@@ -2309,8 +2306,7 @@ static void ResetCorrelatedMarkJoinInfo(JoinHashTable &ht) {
 
 void JoinHashTable::ResetForNewIterationSinglePartition() {
 	if (!layout_ptr) {
-		// Layout was never published on this HT (no Sink chunk arrived in the previous iteration).
-		// Nothing to reset; the next iteration's first chunk will publish.
+		// layout was never published (no Sink chunk last iteration); the next first chunk will publish
 		return;
 	}
 	data_collection->Reset();
@@ -2614,16 +2610,14 @@ void JoinHashTable::BuildDictionaryArrays(const PhysicalHashJoin &op) {
 	(void)collected;
 	const auto row_ptrs = FlatVector::GetData<data_ptr_t>(row_pointer_vector);
 
-	// LEFT / OUTER joins fill unmatched probe rows with a constant-NULL vector (ScanStructure::NextLeftJoin),
-	// so they do not wrap this entry on every output chunk -- it is only pipeline-global when every chunk
-	// goes through EmitDictVectors (INNER / RIGHT / RIGHT_SEMI / RIGHT_ANTI).
+	// LEFT / OUTER joins fill unmatched probe rows with a constant-NULL vector (NextLeftJoin), so they do not
+	// wrap this entry on every chunk; it is only pipeline-global when every chunk goes through EmitDictVectors.
 	const bool dict_on_every_chunk = join_type != JoinType::LEFT && join_type != JoinType::OUTER;
 
 	// gather RHS output columns into columnar dictionary arrays
 	const auto &sel = *FlatVector::IncrementalSelectionVector();
 	for (idx_t col_idx = 0; col_idx < op.rhs_output_columns.col_types.size(); col_idx++) {
 		const auto &type = op.rhs_output_columns.col_types[col_idx];
-		// BuildDictionaryArrays runs once at finalize; the entry it mints is wrapped by every probe-output chunk
 		auto dict_entry = dict_on_every_chunk
 		                      ? DictionaryVector::CreateReusablePipelineGlobalDictionary(type, build_count)
 		                      : DictionaryVector::CreateReusableDictionary(type, build_count);
