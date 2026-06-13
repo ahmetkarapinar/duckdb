@@ -491,7 +491,11 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 				slot.accumulated_sel.set_index(base + row, source_sel.get_index(row));
 			}
 		} else {
-			// flat column: append exactly like DataChunk::Append does per column
+			// flat column: append exactly like DataChunk::Append does per column. A State-B column is a
+			// zero-width placeholder in cached_chunk, so it must never reach this flat Append; assert the
+			// column is genuinely flat (no pinned entry) to catch a future refactor that decouples the
+			// branch condition above from the append.
+			D_ASSERT(!slot.entry);
 			FlatVector::SetSize(cache.data[col_idx], base);
 			cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);
 		}

@@ -286,8 +286,9 @@ public:
 	bool must_return_continuation_chunk = false;
 	OperatorResultType cached_result;
 
-	//! One slot per cached column; a column accumulates a dictionary iff its entry is set. All-empty
-	//! (the common case) means the cache is plain flat caching and behaves exactly as before.
+	//! One slot per cached column. Tag invariant: entry != null iff the column is in State B (it
+	//! accumulates a pipeline-global dictionary); entry == null iff State A (plain flat caching). All
+	//! entries empty (the common case) means the cache is plain flat caching and behaves as before.
 	vector<CachedDictColumn> dict_columns;
 	bool dict_cache_active = false;
 };
