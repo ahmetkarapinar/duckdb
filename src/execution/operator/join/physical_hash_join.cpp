@@ -313,8 +313,8 @@ static bool BuildSideHasMultipleSources(const PhysicalOperator &op) {
 //! Synchronisation state for the first-chunk publication of the TupleDataLayout: the canonical layout
 //! shared by all per-thread JHTs, plus the per-column decision on whether to narrow the row-store slot.
 struct LayoutGate {
-	std::mutex publish_mutex;
-	std::atomic<bool> published {false};
+	mutex publish_mutex;
+	atomic<bool> published {false};
 	shared_ptr<TupleDataLayout> layout_ptr;
 	vector<uint8_t> dict_index_width;
 
@@ -640,7 +640,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	if (layout_gate.published.load(std::memory_order_acquire)) {
 		return;
 	}
-	std::unique_lock<std::mutex> guard(layout_gate.publish_mutex);
+	unique_lock<mutex> guard(layout_gate.publish_mutex);
 	if (layout_gate.published.load(std::memory_order_relaxed)) {
 		return;
 	}
@@ -994,7 +994,7 @@ void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &
 	// If no Sink chunk ever arrived, the layout was never published. Fall back to a default layout
 	// (all columns at their native width) so finalize-time scans can dereference data_collection.
 	if (!gstate.layout_gate.published.load(std::memory_order_acquire)) {
-		std::unique_lock<std::mutex> guard(gstate.layout_gate.publish_mutex);
+		unique_lock<mutex> guard(gstate.layout_gate.publish_mutex);
 		if (!gstate.layout_gate.published.load(std::memory_order_relaxed)) {
 			const auto &cond_types = gstate.hash_table->condition_types;
 			const auto &build_types = gstate.hash_table->build_types;

@@ -470,11 +470,23 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
 		auto &slot = state.dict_columns[col_idx];
 		if (slot.entry) {
-			// dict column: must still be the same pipeline-global entry (guaranteed for the two
-			// qualifying producers; the asserts catch a producer that breaks the invariant)
-			D_ASSERT(DictionaryVector::IsPipelineGlobal(source.data[col_idx]));
-			D_ASSERT(source.data[col_idx].Buffer().Cast<DictionaryBuffer>().GetEntry().id == slot.entry->id);
-			const auto &source_sel = DictionaryVector::SelVector(source.data[col_idx]);
+			// dict column: the slot was seeded from a pipeline-global entry, so every subsequent chunk for
+			// this column must arrive as the same pipeline-global dictionary. Mirror the join sink's Build
+			// pre-pass: a release-active throw (not a D_ASSERT) before the unchecked Cast<DictionaryBuffer>
+			// below, because in release that cast on a non-dict vector is undefined behaviour that would
+			// accumulate foreign bytes as selection indices. The check short-circuits so the dict accessors
+			// never run on a non-dict vector.
+			auto &source_col = source.data[col_idx];
+			if (source_col.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
+			    DictionaryVector::DictionaryId(source_col).empty() || !DictionaryVector::IsPipelineGlobal(source_col)) {
+				throw InternalException("dict-surviving cache: column %llu received a non-pipeline-global "
+				                        "chunk after being seeded for dictionary caching",
+				                        static_cast<unsigned long long>(col_idx));
+			}
+			// Once the encoding check passes, an id mismatch is a purely logical producer bug (never
+			// user-triggerable), so assert rather than throw.
+			D_ASSERT(source_col.Buffer().Cast<DictionaryBuffer>().GetEntry().id == slot.entry->id);
+			const auto &source_sel = DictionaryVector::SelVector(source_col);
 			for (idx_t row = 0; row < added; row++) {
 				slot.accumulated_sel.set_index(base + row, source_sel.get_index(row));
 			}
