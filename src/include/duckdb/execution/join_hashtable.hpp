@@ -60,15 +60,11 @@ private:
    [POINTER]
    The pointers are either NULL
 
-   Two-phase lifecycle (deferred layout construction):
-   The constructor populates only layout-INDEPENDENT state (condition/build types, equality predicates, residual
-   setup, radix bits, partition masks). All layout-DEPENDENT state -- layout_ptr, the row matchers,
-   tuple_size/pointer_offset/entry_size, data_collection, sink_collection, dead_end, dict_registry -- is published
-   later by FinishInitWithLayout, which runs once on the first build chunk to reach the sink (so the row-store slot
-   widths can be chosen from what the data actually looks like at runtime; see PhysicalHashJoin::PublishLayoutIfFirst).
-   Until then the JHT is NOT usable: the only members safe to read pre-finalization are the null-safe Count() /
-   SizeInBytes() accessors. IsLayoutFinalized() reports which phase the JHT is in; the layout-dependent accessors
-   assert it.
+   Two-phase lifecycle: the constructor populates only layout-INDEPENDENT state; all layout-DEPENDENT state
+   (layout_ptr, row matchers, tuple_size/pointer_offset/entry_size, data_collection, sink_collection, dead_end,
+   dict_registry) is published by FinishInitWithLayout on the first build chunk, so slot widths can be chosen from
+   the data's actual runtime encoding. Until then the JHT is unusable except for the null-safe Count() /
+   SizeInBytes() accessors; the layout-dependent accessors assert IsLayoutFinalized().
 */
 class JoinHashTable {
 public:
@@ -243,9 +239,8 @@ public:
 		return layout_ptr.get() != nullptr;
 	}
 
-	//! Per-column eligibility + index-width decision for the dict-surviving optimisation, consulted by the layout
-	//! publisher on the first build chunk. Returns the narrowed index byte width (1/2/4) for the arriving vector,
-	//! or 0 to keep native width. The join-level shape gate stays in the operator.
+	//! Per-column index-width decision for the dict-surviving optimisation, consulted by the layout publisher on
+	//! the first build chunk. Returns the narrowed index byte width (1/2/4), or 0 to keep native width.
 	uint8_t GetDictSurvivingIndexWidth(idx_t build_col_idx, const Vector &incoming) const;
 
 	//! Add the given data to the HT
@@ -304,14 +299,13 @@ public:
 	}
 
 	PartitionedTupleData &GetSinkCollection() {
-		// Layout-dependent: only valid after FinishInitWithLayout has allocated sink_collection. Fail loudly here
-		// rather than as a confusing null-deref if a future path touches it before the first Sink chunk.
+		// Only valid after FinishInitWithLayout; assert so a premature access fails loudly, not as a null-deref.
 		D_ASSERT(IsLayoutFinalized());
 		return *sink_collection;
 	}
 
 	TupleDataCollection &GetDataCollection() {
-		// Layout-dependent: only valid after FinishInitWithLayout has allocated data_collection (see above).
+		// Only valid after FinishInitWithLayout (see GetSinkCollection).
 		D_ASSERT(IsLayoutFinalized());
 		return *data_collection;
 	}
@@ -397,11 +391,11 @@ public:
 	bool use_dict_emission = false;
 	//! Pre-materialized columnar data, one entry per RHS output column
 	vector<buffer_ptr<DictionaryEntry>> dict_arrays;
-	//! Per build payload column: dict entry pinned from the upstream producer. A non-null entry means
-	//! the row store carries a narrow dict index for this column instead of the native value.
+	//! Per build payload column: pinned upstream dict entry. Non-null means the row store carries a narrow dict
+	//! index for this column instead of the native value.
 	vector<buffer_ptr<DictionaryEntry>> dict_registry;
-	//! Per build payload column: byte width of the narrowed dict-index slot (0 = not narrowed, else 1/2/4).
-	//! Parallel to build_types; set by FinishInitWithLayout from the published gate decision.
+	//! Per build payload column: byte width of the narrowed dict-index slot (0 = native, else 1/2/4). Parallel to
+	//! build_types; set by FinishInitWithLayout.
 	vector<uint8_t> dict_index_width;
 	//! Saved NEXT_PTR values, indexed by dict index; only allocated when chains_longer_than_one
 	AllocatedData aux_next_ptrs;

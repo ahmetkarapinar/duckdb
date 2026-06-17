@@ -22,8 +22,8 @@ public:
 	Vector data;
 	//! Optional id to uniquely identify re-occurring dictionaries
 	string id;
-	//! True iff the producer wraps this same entry in every output chunk for its lifetime (stable id, no
-	//! flat fall-through). Set only via CreateReusablePipelineGlobalDictionary; read by the dict-surviving join
+	//! True iff the producer wraps this same entry in every output chunk for its lifetime (stable id, no flat
+	//! fall-through). Set only via CreateReusablePipelineGlobalDictionary.
 	bool pipeline_global = false;
 	//! For caching the hashes of a child buffer (mutable: cache is logically const)
 	mutable mutex cached_hashes_lock;

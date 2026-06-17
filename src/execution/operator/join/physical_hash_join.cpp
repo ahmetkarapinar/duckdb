@@ -338,8 +338,8 @@ public:
 		perfect_join_executor = make_uniq<PerfectHashJoinExecutor>(op, *hash_table);
 		auto use_perfect_hash = CanUsePerfectHashJoin(op, *perfect_join_executor);
 		can_use_perfect_hash = use_perfect_hash;
-		// A UNION ALL / recursive CTE on the build side feeds the sink from multiple producers (computed
-		// once from the static plan; it cannot change at runtime), disqualifying dict-surviving.
+		// A multi-source build side (UNION ALL / recursive CTE) feeds the sink from several producers,
+		// disqualifying dict-surviving. Computed once from the static plan; cannot change at runtime.
 		build_side_multi_source = BuildSideHasMultipleSources(op.children[1].get());
 		// For external hash join
 		external = Settings::Get<DebugForceExternalSetting>(context);
@@ -452,8 +452,8 @@ public:
 
 	//! Coordinates first-chunk publication of the TupleDataLayout across parallel sinks.
 	LayoutGate layout_gate;
-	//! True iff this join may use perfect-hash-join at Finalize. PHJ's FullScanHashTable reads payload
-	//! columns at native width, incompatible with dict-surviving slot narrowing, so it disables dict-surviving
+	//! True iff this join may use perfect-hash-join at Finalize. PHJ's FullScanHashTable reads payload at native
+	//! width, so it disables dict-surviving slot narrowing.
 	bool can_use_perfect_hash = false;
 	//! True iff the build subtree funnels multiple producer pipelines into this sink (UNION ALL /
 	//! recursive CTE); disables dict-surviving because the first-chunk layout election is unsound there.
@@ -482,8 +482,8 @@ public:
 		}
 
 		hash_table = op.InitializeHashTable(context, gstate.hash_table->GetRadixBits());
-		// The sink_collection is only available once the layout has been published on the first build chunk;
-		// InitializeAppendState therefore runs lazily inside Sink (see PhysicalHashJoin::Sink).
+		// sink_collection exists only after the layout is published on the first build chunk, so
+		// InitializeAppendState runs lazily inside Sink.
 		keep_hash_table = gstate.keep_local_hash_tables;
 
 		gstate.active_local_states++;
@@ -523,9 +523,8 @@ public:
 			hash_table->ResetForNewIterationSinglePartition();
 			hash_table->GetSinkCollection().ResetAppendState(append_state);
 		} else {
-			// HT was moved into gstate during Combine, or exists but never had a layout published (stale
-			// radix_bits vs the global single-partition reset). Rebuild against the global radix_bits so
-			// partition counts stay consistent in PrepareFinalize.
+			// HT was moved into gstate during Combine, or never had a layout published. Rebuild against the global
+			// radix_bits so partition counts stay consistent in PrepareFinalize.
 			hash_table = op.InitializeHashTable(context.client, gstate.hash_table->GetRadixBits());
 			append_state_initialised = false;
 		}
@@ -539,8 +538,7 @@ public:
 	}
 };
 
-//! Row-store slot type for a dict index of the given byte width (the per-column width itself is decided by
-//! JoinHashTable::GetDictSurvivingIndexWidth; this only maps it to the layout slot type)
+//! Map a dict-index byte width to its row-store slot type (the width is decided by GetDictSurvivingIndexWidth)
 static LogicalType DictIndexType(uint8_t index_width) {
 	switch (index_width) {
 	case sizeof(uint8_t):
@@ -552,9 +550,8 @@ static LogicalType DictIndexType(uint8_t index_width) {
 	}
 }
 
-//! Build the hash-join row layout [conditions, build payload, (found flag), hash], narrowing a payload column to
-//! its dict-index slot when dict_index_width[col] != 0. Shared by publisher and empty-input fallback so they can't
-//! drift.
+//! Build the row layout [conditions, build payload, (found flag), hash], narrowing a payload column to its
+//! dict-index slot when dict_index_width[col] != 0. Shared by publisher and empty-input fallback to avoid drift.
 static shared_ptr<TupleDataLayout> BuildJoinLayout(const vector<LogicalType> &cond_types,
                                                    const vector<LogicalType> &build_types, JoinType join_type,
                                                    const vector<uint8_t> &dict_index_width) {
@@ -605,8 +602,7 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	if (op.rhs_output_columns.col_types.empty()) {
 		return false;
 	}
-	// PHJ's FullScanHashTable reads payload columns directly from the row store at native width;
-	// a narrowed dict-index slot would corrupt that scan.
+	// PHJ's FullScanHashTable reads payload from the row store at native width; a narrowed slot would corrupt it.
 	if (can_use_perfect_hash) {
 		return false;
 	}
@@ -639,8 +635,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	layout_gate.dict_index_width.assign(build_types.size(), 0);
 
 	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash, build_side_multi_source)) {
-		// The join-level gate is sink state; the per-column width decision lives on the JHT
-		// (GetDictSurvivingIndexWidth). Here the publisher just feeds it the arriving vector and records the width.
+		// Per-column width decision lives on the JHT (GetDictSurvivingIndexWidth); feed it each arriving vector.
 		for (idx_t col = 0; col < build_types.size(); col++) {
 			if (col >= payload_chunk.ColumnCount()) {
 				continue;

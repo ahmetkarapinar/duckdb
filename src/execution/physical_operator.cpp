@@ -425,11 +425,10 @@ static bool ChunkHasPipelineGlobalDict(const DataChunk &chunk) {
 	return false;
 }
 
-//! Switch the empty cache to dictionary mode for each pipeline-global dict column: pin the upstream entry,
-//! allocate its sel accumulator, and make its flat cache slot a zero-width placeholder so dict and flat columns
-//! stay row-aligned. A column's dict/flat tag is frozen on this first chunk; correctness then relies on the
-//! producer emitting the same entry on every chunk, never falling back to flat (enforced by the throw in
-//! AppendToCache).
+//! Switch the empty cache to dictionary mode: pin each pipeline-global dict column's upstream entry, allocate its
+//! sel accumulator, and make its flat cache slot a zero-width placeholder so dict and flat columns stay
+//! row-aligned. A column's dict/flat tag is frozen here; correctness then relies on the producer never falling
+//! back to flat (enforced by the throw in AppendToCache).
 static void SeedDictCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
 	const idx_t col_count = source.ColumnCount();
 	state.dict_columns.clear();
@@ -447,9 +446,8 @@ static void SeedDictCache(CachingOperatorState &state, DataChunk &source, Client
 	// dict columns become zero-width placeholders in cached_chunk; the dict lives in the accumulator
 	state.cached_chunk->Destroy();
 	state.cached_chunk->Initialize(Allocator::Get(client_context), source.GetTypes(), flat_initialize);
-	// The freshly seeded cache is empty. When every column is a dict placeholder there is no flat vector to
-	// derive a cardinality from, so set the count explicitly (optional_idx contract) before AppendToCache reads
-	// cache.size().
+	// With every column a zero-width placeholder there is no flat vector to derive a cardinality from, so set the
+	// count explicitly before AppendToCache reads cache.size().
 	state.cached_chunk->SetChildCardinality(0);
 	state.dict_cache_active = true;
 }
@@ -472,16 +470,14 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 	}
 	const idx_t base = cache.size();
 	const idx_t added = source.size();
-	// accumulated_sel is sized STANDARD_VECTOR_SIZE; the FSM's has_space_for_chunk_in_cache gate guarantees
-	// base + added stays within it. Assert it -- the index accumulation has no overrun guard of its own (unlike
-	// the flat Append's ERROR_ON_NO_SPACE), so a future FSM edit that over-appends must fail loudly here.
+	// accumulated_sel is sized STANDARD_VECTOR_SIZE and the caching state machine guarantees base + added stays
+	// within it. Index accumulation has no overrun guard of its own (unlike the flat Append), so assert it.
 	D_ASSERT(base + added <= STANDARD_VECTOR_SIZE);
 	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
 		auto &slot = state.dict_columns[col_idx];
 		if (slot.entry) {
-			// dict column: every later chunk must arrive as the same pipeline-global dictionary. Throw, not
-			// D_ASSERT, before the unchecked Cast below: in release that cast on a non-dict vector is UB
-			// accumulating foreign bytes as selection indices.
+			// dict column: every later chunk must be the same pipeline-global dictionary. Throw (not D_ASSERT)
+			// because the Cast below is UB on a non-dict vector in release, accumulating foreign bytes as indices.
 			auto &source_col = source.data[col_idx];
 			if (source_col.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(source_col).empty() || !DictionaryVector::IsPipelineGlobal(source_col)) {
@@ -489,16 +485,14 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 				                        "chunk after being seeded for dictionary caching",
 				                        static_cast<unsigned long long>(col_idx));
 			}
-			// Once the encoding check passes, an id mismatch is a purely logical producer bug (never
-			// user-triggerable), so assert rather than throw.
+			// An id mismatch past the encoding check is a producer bug (never user-triggerable), so assert.
 			D_ASSERT(source_col.Buffer().Cast<DictionaryBuffer>().GetEntry().id == slot.entry->id);
 			const auto &source_sel = DictionaryVector::SelVector(source_col);
 			for (idx_t row = 0; row < added; row++) {
 				slot.accumulated_sel.set_index(base + row, source_sel.get_index(row));
 			}
 		} else {
-			// flat column: append per column like DataChunk::Append. A dict column is a zero-width placeholder
-			// and must never reach here, so assert no pinned entry to catch a refactor that decouples this branch.
+			// flat column: append per column. The D_ASSERT catches a refactor that routes a dict placeholder here.
 			D_ASSERT(!slot.entry);
 			FlatVector::SetSize(cache.data[col_idx], base);
 			cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);
@@ -566,10 +560,9 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 
 	const auto execution_mode = SelectExecutionMode(chunk, child_result, state);
 
-	// Appends and flushes MUST go through AppendToCache / FlushCacheToChunk: a raw Append would flatten a
-	// zero-width dict placeholder and corrupt the chunk size, and a raw flush would drop the dict. Any new FSM
-	// mode must route through these helpers. (The continuation case below Moves a fresh chunk in -- a full
-	// replacement after flush+reset, not an append, so raw dict columns pass through verbatim.)
+	// Appends and flushes MUST route through AppendToCache / FlushCacheToChunk: a raw Append flattens a zero-width
+	// dict placeholder and a raw flush drops the dict. (The continuation case below Moves a fresh chunk in -- a
+	// full replacement, not an append -- so raw dict columns pass through verbatim.)
 	switch (execution_mode) {
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK: {
 		auto tmp = make_uniq<DataChunk>();

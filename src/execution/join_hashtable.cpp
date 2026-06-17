@@ -177,8 +177,7 @@ void JoinHashTable::Merge(JoinHashTable &other) {
 		if (!dict_registry[col]) {
 			dict_registry[col] = std::move(other.dict_registry[col]);
 		} else {
-			// Both threads pinned the same upstream entry, so ids match by construction. A mismatch would
-			// be a producer bug (never user-triggerable), so assert rather than throw.
+			// Both threads pinned the same upstream entry, so ids match by construction; a mismatch is a producer bug.
 			D_ASSERT(dict_registry[col]->id == other.dict_registry[col]->id);
 		}
 	}
@@ -488,7 +487,7 @@ uint8_t JoinHashTable::GetDictSurvivingIndexWidth(idx_t build_col_idx, const Vec
 	if (!dict_size.IsValid()) {
 		return 0;
 	}
-	// only narrow when strictly smaller than the native slot (never regress; e.g. INTEGER over a D<=256 dict -> 1 byte)
+	// only narrow when strictly smaller than the native slot (never regress; e.g. INTEGER over a D<=256 dict)
 	const uint8_t index_width = DictIndexWidth(dict_size.GetIndex());
 	const auto native_bytes = GetTypeIdSize(type.InternalType());
 	if (index_width >= native_bytes) {
@@ -533,9 +532,8 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 	}
 	idx_t col_offset = keys.ColumnCount();
 	D_ASSERT(build_types.size() == payload.ColumnCount());
-	// Scratch index vectors for narrowed columns. Allocated via the buffer manager (accounted, unlike the
-	// default allocator); buffers own the bytes, vectors are flat views into source_chunk. Both must outlive
-	// the ToUnifiedFormat / AppendUnified calls below.
+	// Scratch index vectors for narrowed columns, allocated via the buffer manager so the bytes are accounted.
+	// buffers own the bytes, vectors are flat views; both must outlive the ToUnifiedFormat / AppendUnified below.
 	vector<AllocatedData> dict_idx_buffers;
 	vector<Vector> dict_idx_vectors;
 	for (idx_t i = 0; i < payload.ColumnCount(); i++) {
@@ -553,14 +551,12 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			// Pin the dictionary on the first chunk; enforce id continuity on subsequent chunks
 			auto entry_ptr = incoming.BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
 			if (!dict_registry[i]) {
-				// The upstream child comes from a zero-copy gather: its long strings point into the producer's
-				// row-store heap, recycled before we gather on probe. Deep-copy into a self-owned entry so the
-				// child outlives the producer.
+				// The upstream child is a zero-copy gather: its long strings point into the producer's row-store
+				// heap, recycled before we gather on probe. Deep-copy into a self-owned entry so it outlives them.
 				const auto &upstream_child = entry_ptr->data;
 				const auto child_count = upstream_child.size();
-				// child_count fits index_width by construction (publisher sized it to this dict). Assert it so a
-				// future producer that grows the child past the published width fails loudly instead of silently
-				// truncating in the UnsafeNumericCast below (1 << 8*width is the width's index capacity).
+				// child_count fits index_width by construction (publisher sized the width to this dict). Assert so a
+				// producer that grows the child past it fails loudly instead of truncating in the UnsafeNumericCast.
 				D_ASSERT(child_count <= (idx_t(1) << (8 * index_width)));
 				auto owned_entry =
 				    DictionaryVector::CreateReusablePipelineGlobalDictionary(upstream_child.GetType(), child_count);
@@ -570,8 +566,7 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				owned_entry->id = entry_ptr->id;
 				dict_registry[i] = std::move(owned_entry);
 			} else {
-				// Subsequent chunks wrap the same upstream entry, so the id matches by construction. A
-				// mismatch is a producer bug (never user-triggerable), so assert rather than throw.
+				// Subsequent chunks wrap the same entry, so ids match by construction; a mismatch is a producer bug.
 				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
@@ -1618,7 +1613,7 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 			if (payload_idx < dict_registry.size() && dict_registry[payload_idx]) {
 				SelectionVector build_sel_vec(count);
 				const auto col_offset = offsets[output_col_idx];
-				// Read the dict index at the width chosen for this column at layout-publication time
+				// Read the dict index at the width chosen at layout-publication time
 				const uint8_t index_width = payload_idx < dict_index_width.size() ? dict_index_width[payload_idx] : 0;
 				switch (index_width) {
 				case sizeof(uint8_t):
