@@ -59,6 +59,16 @@ private:
    [POINTER]
    [POINTER]
    The pointers are either NULL
+
+   Two-phase lifecycle (deferred layout construction):
+   The constructor populates only layout-INDEPENDENT state (condition/build types, equality predicates, residual
+   setup, radix bits, partition masks). All layout-DEPENDENT state -- layout_ptr, the row matchers,
+   tuple_size/pointer_offset/entry_size, data_collection, sink_collection, dead_end, dict_registry -- is published
+   later by FinishInitWithLayout, which runs once on the first build chunk to reach the sink (so the row-store slot
+   widths can be chosen from what the data actually looks like at runtime; see PhysicalHashJoin::PublishLayoutIfFirst).
+   Until then the JHT is NOT usable: the only members safe to read pre-finalization are the null-safe Count() /
+   SizeInBytes() accessors. IsLayoutFinalized() reports which phase the JHT is in; the layout-dependent accessors
+   assert it.
 */
 class JoinHashTable {
 public:
@@ -297,10 +307,15 @@ public:
 	}
 
 	PartitionedTupleData &GetSinkCollection() {
+		// Layout-dependent: only valid after FinishInitWithLayout has allocated sink_collection. Fail loudly here
+		// rather than as a confusing null-deref if a future path touches it before the first Sink chunk.
+		D_ASSERT(IsLayoutFinalized());
 		return *sink_collection;
 	}
 
 	TupleDataCollection &GetDataCollection() {
+		// Layout-dependent: only valid after FinishInitWithLayout has allocated data_collection (see above).
+		D_ASSERT(IsLayoutFinalized());
 		return *data_collection;
 	}
 	//! Perform a full scan of a build column, filling the provided addresses vector and result vector.

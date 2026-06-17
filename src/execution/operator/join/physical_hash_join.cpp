@@ -553,6 +553,31 @@ static LogicalType DictIndexType(uint8_t index_width) {
 	}
 }
 
+//! Build the row-store layout for a hash join: [condition_types, build payload, (found flag), hash]. Each build
+//! payload column is narrowed to its dict-index slot type when dict_index_width[col] != 0, otherwise kept at its
+//! native build type. Single source of truth for the layout shape, shared by the first-chunk publisher
+//! (PublishLayoutIfFirst) and the empty-input fallback (PrepareFinalize) so the two cannot drift.
+static shared_ptr<TupleDataLayout> BuildJoinLayout(const vector<LogicalType> &cond_types,
+                                                   const vector<LogicalType> &build_types, JoinType join_type,
+                                                   const vector<uint8_t> &dict_index_width) {
+	vector<LogicalType> layout_types(cond_types);
+	for (idx_t col = 0; col < build_types.size(); col++) {
+		if (col < dict_index_width.size() && dict_index_width[col] != 0) {
+			layout_types.emplace_back(DictIndexType(dict_index_width[col]));
+		} else {
+			layout_types.emplace_back(build_types[col]);
+		}
+	}
+	if (PropagatesBuildSide(join_type)) {
+		layout_types.emplace_back(LogicalType::BOOLEAN);
+	}
+	layout_types.emplace_back(LogicalType::HASH);
+
+	auto layout = make_shared_ptr<TupleDataLayout>();
+	layout->Initialize(layout_types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	return layout;
+}
+
 //! Join-level gate (shape-only checks; same conditions as Project 1's dict-emission, plus PHJ exclusion)
 static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTable &ht, bool external,
                                     bool can_use_perfect_hash, bool build_side_multi_source) {
@@ -630,21 +655,7 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 		}
 	}
 
-	vector<LogicalType> layout_types(cond_types);
-	for (idx_t col = 0; col < build_types.size(); col++) {
-		if (layout_gate.dict_index_width[col] != 0) {
-			layout_types.emplace_back(DictIndexType(layout_gate.dict_index_width[col]));
-		} else {
-			layout_types.emplace_back(build_types[col]);
-		}
-	}
-	if (PropagatesBuildSide(lstate.hash_table->join_type)) {
-		layout_types.emplace_back(LogicalType::BOOLEAN);
-	}
-	layout_types.emplace_back(LogicalType::HASH);
-
-	auto layout = make_shared_ptr<TupleDataLayout>();
-	layout->Initialize(layout_types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+	auto layout = BuildJoinLayout(cond_types, build_types, lstate.hash_table->join_type, layout_gate.dict_index_width);
 	layout_gate.layout_ptr = layout;
 
 	// global HT receives the same layout so Merge/Combine and finalize-time scans operate against it
@@ -937,14 +948,10 @@ void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &
 			const auto &cond_types = gstate.hash_table->condition_types;
 			const auto &build_types = gstate.hash_table->build_types;
 			gstate.layout_gate.dict_index_width.assign(build_types.size(), 0);
-			vector<LogicalType> layout_types(cond_types);
-			layout_types.insert(layout_types.end(), build_types.begin(), build_types.end());
-			if (PropagatesBuildSide(gstate.hash_table->join_type)) {
-				layout_types.emplace_back(LogicalType::BOOLEAN);
-			}
-			layout_types.emplace_back(LogicalType::HASH);
-			auto layout = make_shared_ptr<TupleDataLayout>();
-			layout->Initialize(layout_types, TupleDataValidityType::CAN_HAVE_NULL_VALUES);
+			// All-native fallback (no chunk ever arrived, so no column was narrowed): the all-zero
+			// dict_index_width makes BuildJoinLayout keep every build column at its native width.
+			auto layout = BuildJoinLayout(cond_types, build_types, gstate.hash_table->join_type,
+			                              gstate.layout_gate.dict_index_width);
 			gstate.layout_gate.layout_ptr = layout;
 			if (!gstate.hash_table->IsLayoutFinalized()) {
 				gstate.hash_table->FinishInitWithLayout(layout);
