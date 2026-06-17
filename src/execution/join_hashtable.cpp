@@ -448,8 +448,11 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 	}
 	idx_t col_offset = keys.ColumnCount();
 	D_ASSERT(build_types.size() == payload.ColumnCount());
-	// Scratch vectors of dictionary sel indices, materialised lazily for dict-surviving columns.
-	// Stored here so the buffers outlive ToUnifiedFormat / AppendUnified below.
+	// Scratch index vectors for dict-surviving columns, materialised lazily. Their bytes are allocated through
+	// the JHT's buffer manager (not the default allocator) so the scratch is accounted; dict_idx_buffers owns
+	// the allocations and dict_idx_vectors holds flat views referenced into source_chunk. Both outlive the
+	// ToUnifiedFormat / AppendUnified calls below and are recycled when Build returns.
+	vector<AllocatedData> dict_idx_buffers;
 	vector<Vector> dict_idx_vectors;
 	for (idx_t i = 0; i < payload.ColumnCount(); i++) {
 		auto &incoming = payload.data[i];
@@ -472,6 +475,12 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				// self-owned deep copy so the child outlives the producer, preserving id and pipeline_global.
 				const auto &upstream_child = entry_ptr->data;
 				const auto child_count = upstream_child.size();
+				// The publisher chose index_width from the dictionary size on the first chunk. A pipeline-global
+				// producer wraps one child across every chunk, so child_count fits index_width by construction;
+				// assert it (1 << 8*width is the width's index capacity: 256 / 65536 / 2^32) so a future producer
+				// that grew the child past the published width fails loudly here rather than letting the
+				// UnsafeNumericCast below silently truncate the indices.
+				D_ASSERT(child_count <= (idx_t(1) << (8 * index_width)));
 				auto owned_entry =
 				    DictionaryVector::CreateReusablePipelineGlobalDictionary(upstream_child.GetType(), child_count);
 				if (child_count > 0) {
@@ -488,9 +497,11 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			// construction (the publisher chose it from the dictionary size), so UnsafeNumericCast skips
 			// the per-row bounds check.
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
+			auto &index_allocator = buffer_manager.GetBufferAllocator();
 			switch (index_width) {
 			case sizeof(uint8_t): {
-				dict_idx_vectors.emplace_back(LogicalType::UTINYINT, payload.size());
+				dict_idx_buffers.emplace_back(index_allocator.Allocate(payload.size() * sizeof(uint8_t)));
+				dict_idx_vectors.emplace_back(LogicalType::UTINYINT, dict_idx_buffers.back().get(), payload.size());
 				auto idx_data = FlatVector::GetDataMutable<uint8_t>(dict_idx_vectors.back());
 				for (idx_t r = 0; r < payload.size(); r++) {
 					idx_data[r] = UnsafeNumericCast<uint8_t>(dict_sel.get_index(r));
@@ -498,7 +509,8 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				break;
 			}
 			case sizeof(uint16_t): {
-				dict_idx_vectors.emplace_back(LogicalType::USMALLINT, payload.size());
+				dict_idx_buffers.emplace_back(index_allocator.Allocate(payload.size() * sizeof(uint16_t)));
+				dict_idx_vectors.emplace_back(LogicalType::USMALLINT, dict_idx_buffers.back().get(), payload.size());
 				auto idx_data = FlatVector::GetDataMutable<uint16_t>(dict_idx_vectors.back());
 				for (idx_t r = 0; r < payload.size(); r++) {
 					idx_data[r] = UnsafeNumericCast<uint16_t>(dict_sel.get_index(r));
@@ -506,7 +518,8 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				break;
 			}
 			default: {
-				dict_idx_vectors.emplace_back(LogicalType::UINTEGER, payload.size());
+				dict_idx_buffers.emplace_back(index_allocator.Allocate(payload.size() * sizeof(uint32_t)));
+				dict_idx_vectors.emplace_back(LogicalType::UINTEGER, dict_idx_buffers.back().get(), payload.size());
 				auto idx_data = FlatVector::GetDataMutable<uint32_t>(dict_idx_vectors.back());
 				for (idx_t r = 0; r < payload.size(); r++) {
 					idx_data[r] = UnsafeNumericCast<uint32_t>(dict_sel.get_index(r));
@@ -1535,32 +1548,38 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 		auto &vector = result.data[rhs_col_offset + col_idx];
 		const auto output_col_idx = output_columns[col_idx];
 
-		// dict-surviving column: emit the upstream pipeline-global dictionary directly
-		const idx_t payload_idx = output_col_idx - cond_count;
-		if (payload_idx < dict_registry.size() && dict_registry[payload_idx]) {
-			SelectionVector build_sel_vec(count);
-			const auto col_offset = offsets[output_col_idx];
-			// Read the dict index at the width chosen for this column at layout-publication time
-			const uint8_t index_width = payload_idx < dict_index_width.size() ? dict_index_width[payload_idx] : 0;
-			switch (index_width) {
-			case sizeof(uint8_t):
-				for (idx_t i = 0; i < count; i++) {
-					build_sel_vec.set_index(i, Load<uint8_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+		// dict-surviving column: emit the upstream pipeline-global dictionary directly. The layout is
+		// [condition_types, build_types, (found), hash], so build-payload columns map to layout indices
+		// >= cond_count; a join key surfaced as an output column maps below cond_count and is never pinned in
+		// dict_registry. Guard the subtraction explicitly so it cannot underflow idx_t into a spuriously large
+		// payload_idx (which would happen to miss the dict_registry bound, but only by unsigned wraparound).
+		if (output_col_idx >= cond_count) {
+			const idx_t payload_idx = output_col_idx - cond_count;
+			if (payload_idx < dict_registry.size() && dict_registry[payload_idx]) {
+				SelectionVector build_sel_vec(count);
+				const auto col_offset = offsets[output_col_idx];
+				// Read the dict index at the width chosen for this column at layout-publication time
+				const uint8_t index_width = payload_idx < dict_index_width.size() ? dict_index_width[payload_idx] : 0;
+				switch (index_width) {
+				case sizeof(uint8_t):
+					for (idx_t i = 0; i < count; i++) {
+						build_sel_vec.set_index(i, Load<uint8_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+					}
+					break;
+				case sizeof(uint16_t):
+					for (idx_t i = 0; i < count; i++) {
+						build_sel_vec.set_index(i, Load<uint16_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+					}
+					break;
+				default:
+					for (idx_t i = 0; i < count; i++) {
+						build_sel_vec.set_index(i, Load<uint32_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
+					}
+					break;
 				}
-				break;
-			case sizeof(uint16_t):
-				for (idx_t i = 0; i < count; i++) {
-					build_sel_vec.set_index(i, Load<uint16_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
-				}
-				break;
-			default:
-				for (idx_t i = 0; i < count; i++) {
-					build_sel_vec.set_index(i, Load<uint32_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
-				}
-				break;
+				vector.Dictionary(dict_registry[payload_idx], build_sel_vec, count);
+				continue;
 			}
-			vector.Dictionary(dict_registry[payload_idx], build_sel_vec, count);
-			continue;
 		}
 
 		D_ASSERT(vector.GetType() == layout_ptr->GetTypes()[output_col_idx]);
