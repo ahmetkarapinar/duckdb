@@ -428,6 +428,11 @@ static bool ChunkHasPipelineGlobalDict(const DataChunk &chunk) {
 //! Switch the (empty) cache to dictionary mode for every pipeline-global dict column: pin the
 //! upstream entry, allocate its sel accumulator, and rebuild the flat cache with a placeholder slot
 //! for each such column so dict and flat columns stay row-aligned.
+//! Seeding is first-chunk-only (the caller gates it on an empty cache, see AppendToCache), so a column's
+//! State A/B tag is frozen for the whole fill. Unlike the join sink, the caching operator has no B-gate of
+//! its own: correctness depends on the upstream pipeline-global producer emitting the dictionary uniformly
+//! on every chunk (the same entry, never a flat fall-through) -- enforced downstream by the release-active
+//! throw in AppendToCache's State-B branch.
 static void SeedDictCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
 	const idx_t col_count = source.ColumnCount();
 	state.dict_columns.clear();
@@ -467,6 +472,12 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 	}
 	const idx_t base = cache.size();
 	const idx_t added = source.size();
+	// State B accumulates indices into accumulated_sel, sized STANDARD_VECTOR_SIZE in SeedDictCache. The FSM's
+	// has_space_for_chunk_in_cache gate (SelectExecutionMode) guarantees base + added <= STANDARD_VECTOR_SIZE, so
+	// the per-row set_index loop below stays in bounds. Assert it -- unlike the State-A flat Append, which throws
+	// via ERROR_ON_NO_SPACE, the State-B accumulation has no built-in overrun guard, so a future FSM edit that
+	// over-appends must fail loudly here instead of overrunning the selection vector.
+	D_ASSERT(base + added <= STANDARD_VECTOR_SIZE);
 	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
 		auto &slot = state.dict_columns[col_idx];
 		if (slot.entry) {
@@ -559,6 +570,12 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 
 	const auto execution_mode = SelectExecutionMode(chunk, child_result, state);
 
+	// Cache appends and flushes MUST go through AppendToCache / FlushCacheToChunk (which call RewrapDictColumns).
+	// A raw cached_chunk->Append would flatten a State-B pipeline-global dict placeholder (a zero-width column)
+	// and corrupt the chunk size; a raw flush that Moves the cache out without RewrapDictColumns drops the dict.
+	// Any new FSM mode added below must route its append/flush through these helpers. (The continuation case
+	// below does Move a *fresh* incoming chunk back into cached_chunk -- that is a full replacement after the
+	// cache was already flushed+reset, not an append, and carries any raw dict columns through verbatim.)
 	switch (execution_mode) {
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK: {
 		auto tmp = make_uniq<DataChunk>();
