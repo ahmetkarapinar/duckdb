@@ -285,8 +285,8 @@ public:
 	bool must_return_continuation_chunk = false;
 	OperatorResultType cached_result;
 
-	//! One slot per cached column. Tag invariant: entry != null iff the column is in State B (accumulating a
-	//! pipeline-global dictionary), entry == null iff State A (plain flat caching, the common case)
+	//! One slot per cached column. Invariant: entry != null iff the column is accumulating a pipeline-global
+	//! dictionary; entry == null iff plain flat caching (the common case)
 	vector<CachedDictColumn> dict_columns;
 	bool dict_cache_active = false;
 };

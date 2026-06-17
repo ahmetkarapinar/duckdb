@@ -294,9 +294,8 @@ unique_ptr<JoinFilterGlobalState> JoinFilterPushdownInfo::GetGlobalState(ClientC
 	return result;
 }
 
-//! True iff the build subtree funnels multiple producer pipelines into one sink (UNION ALL, recursive
-//! CTE), which breaks the publisher's "decide the layout once on the first chunk" contract. Conservative
-//! full-subtree walk: never misses a union, may over-exclude one shielded by a materialising sink.
+//! True iff the build subtree funnels multiple producer pipelines into one sink (UNION ALL, recursive CTE),
+//! breaking the "decide layout once on the first chunk" contract. Conservative: may over-exclude, never misses one.
 static bool BuildSideHasMultipleSources(const PhysicalOperator &op) {
 	if (op.type == PhysicalOperatorType::UNION || op.type == PhysicalOperatorType::RECURSIVE_CTE ||
 	    op.type == PhysicalOperatorType::RECURSIVE_KEY_CTE) {
@@ -524,9 +523,9 @@ public:
 			hash_table->ResetForNewIterationSinglePartition();
 			hash_table->GetSinkCollection().ResetAppendState(append_state);
 		} else {
-			// Either the local HT was moved into gstate during Combine, or it exists but never had a layout
-			// published (so its radix_bits are stale while the global HT reset to single-partition). Rebuild
-			// against the current global radix_bits so partition counts stay consistent in PrepareFinalize.
+			// HT was moved into gstate during Combine, or exists but never had a layout published (stale
+			// radix_bits vs the global single-partition reset). Rebuild against the global radix_bits so
+			// partition counts stay consistent in PrepareFinalize.
 			hash_table = op.InitializeHashTable(context.client, gstate.hash_table->GetRadixBits());
 			append_state_initialised = false;
 		}
@@ -553,10 +552,9 @@ static LogicalType DictIndexType(uint8_t index_width) {
 	}
 }
 
-//! Build the row-store layout for a hash join: [condition_types, build payload, (found flag), hash]. Each build
-//! payload column is narrowed to its dict-index slot type when dict_index_width[col] != 0, otherwise kept at its
-//! native build type. Single source of truth for the layout shape, shared by the first-chunk publisher
-//! (PublishLayoutIfFirst) and the empty-input fallback (PrepareFinalize) so the two cannot drift.
+//! Build the hash-join row layout [conditions, build payload, (found flag), hash], narrowing a payload column to
+//! its dict-index slot when dict_index_width[col] != 0. Shared by publisher and empty-input fallback so they can't
+//! drift.
 static shared_ptr<TupleDataLayout> BuildJoinLayout(const vector<LogicalType> &cond_types,
                                                    const vector<LogicalType> &build_types, JoinType join_type,
                                                    const vector<uint8_t> &dict_index_width) {
@@ -578,7 +576,7 @@ static shared_ptr<TupleDataLayout> BuildJoinLayout(const vector<LogicalType> &co
 	return layout;
 }
 
-//! Join-level gate (shape-only checks; same conditions as Project 1's dict-emission, plus PHJ exclusion)
+//! Join-level gate: shape-only eligibility checks, mirroring the dict-emission path plus a PHJ exclusion
 static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTable &ht, bool external,
                                     bool can_use_perfect_hash, bool build_side_multi_source) {
 	// external joins rebuild partitions; pinned upstream entries cannot survive the rebuild
@@ -594,15 +592,13 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	if (ht.join_type == JoinType::SINGLE) {
 		return false;
 	}
-	// LEFT joins may dispatch into NextUniqueLeftJoin (when !chains_longer_than_one), which gathers payload
-	// columns through ScanStructure::GatherResult, bypassing GatherRHS' dict-surviving branch; the narrowed
-	// slot would then be read as the native type and trip the templated-gather type check.
+	// LEFT may dispatch into NextUniqueLeftJoin, which gathers payload via ScanStructure::GatherResult and
+	// bypasses GatherRHS' dict branch; the narrowed slot would be read as native type and trip the gather type check.
 	if (ht.join_type == JoinType::LEFT) {
 		return false;
 	}
-	// OUTER joins fill unmatched-probe rows with a constant-NULL vector (ScanStructure::NextLeftJoin), so their
-	// output stream mixes pipeline-global dict chunks (matched rows via GatherRHS) with CONSTANT_NULL fill chunks.
-	// Admitting OUTER would re-emit a falsely pipeline-global dictionary that a downstream consumer cannot trust.
+	// OUTER fills unmatched-probe rows with CONSTANT_NULL (NextLeftJoin), mixing dict chunks with flat fill chunks;
+	// admitting it would re-emit a falsely pipeline-global dictionary a downstream consumer cannot trust.
 	if (ht.join_type == JoinType::OUTER) {
 		return false;
 	}
@@ -643,9 +639,8 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	layout_gate.dict_index_width.assign(build_types.size(), 0);
 
 	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash, build_side_multi_source)) {
-		// The join-level gate above is operator/sink state; the per-column width decision is algorithm and
-		// lives on the JoinHashTable (GetDictSurvivingIndexWidth). The publisher only supplies the vector
-		// actually arriving for each column and records the chosen width.
+		// The join-level gate is sink state; the per-column width decision lives on the JHT
+		// (GetDictSurvivingIndexWidth). Here the publisher just feeds it the arriving vector and records the width.
 		for (idx_t col = 0; col < build_types.size(); col++) {
 			if (col >= payload_chunk.ColumnCount()) {
 				continue;
@@ -948,8 +943,7 @@ void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &
 			const auto &cond_types = gstate.hash_table->condition_types;
 			const auto &build_types = gstate.hash_table->build_types;
 			gstate.layout_gate.dict_index_width.assign(build_types.size(), 0);
-			// All-native fallback (no chunk ever arrived, so no column was narrowed): the all-zero
-			// dict_index_width makes BuildJoinLayout keep every build column at its native width.
+			// all-zero dict_index_width => BuildJoinLayout keeps every build column at its native width
 			auto layout = BuildJoinLayout(cond_types, build_types, gstate.hash_table->join_type,
 			                              gstate.layout_gate.dict_index_width);
 			gstate.layout_gate.layout_ptr = layout;
@@ -1769,9 +1763,8 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 
 	// check for possible perfect hash table
 	auto use_perfect_hash = sink.perfect_join_executor->CanDoPerfectHashJoin(*this, min, max);
-	// PHJ's FullScanHashTable reads payload columns at their native width; if dict-surviving narrowed
-	// any slot that scan would crash. The plan-time gate can be flipped back here by runtime min/max
-	// from filter pushdown, so re-check at Finalize.
+	// PHJ's FullScanHashTable reads payload at native width; if any slot was narrowed it would crash. Runtime
+	// min/max from filter pushdown can re-enable PHJ here, so re-check after dict-surviving may have narrowed.
 	if (use_perfect_hash && sink.DictSurvivingActive()) {
 		use_perfect_hash = false;
 	}

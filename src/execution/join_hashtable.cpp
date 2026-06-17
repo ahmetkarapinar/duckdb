@@ -412,9 +412,9 @@ static idx_t FilterNullValues(UnifiedVectorFormat &vdata, const SelectionVector 
 	return result_count;
 }
 
-// A dictionary of D slots uses indices 0..D-1, so D slots address into a width of W bytes iff D <= 2^(8*W).
-static constexpr idx_t DICT_INDEX_UINT8_CAPACITY = 256;    // 2^8  values fit in a uint8
-static constexpr idx_t DICT_INDEX_UINT16_CAPACITY = 65536; // 2^16 values fit in a uint16
+// A dictionary of D slots uses indices 0..D-1, so D slots fit a W-byte index iff D <= 2^(8*W).
+static constexpr idx_t DICT_INDEX_UINT8_CAPACITY = 256;
+static constexpr idx_t DICT_INDEX_UINT16_CAPACITY = 65536;
 
 //! Narrowest unsigned-integer byte width that can hold any index into a dictionary of dict_size slots
 static uint8_t DictIndexWidth(idx_t dict_size) {
@@ -427,9 +427,8 @@ static uint8_t DictIndexWidth(idx_t dict_size) {
 	return sizeof(uint32_t);
 }
 
-//! Materialise a flat unsigned-int index vector of width INDEX_T over a buffer-manager allocation (owned by
-//! `buffers`, viewed by `vectors`), copying the dictionary sel index into each row. UnsafeNumericCast skips
-//! the per-row bounds check: the publisher chose the width from the dictionary size, so every index fits.
+//! Materialise a flat width-INDEX_T index vector (allocation owned by `buffers`, view in `vectors`) from the
+//! dict sel. UnsafeNumericCast is safe: the publisher sized the width to the dictionary, so every index fits.
 template <class INDEX_T>
 static void ScatterDictIndices(const SelectionVector &dict_sel, idx_t count, const LogicalType &index_type,
                                Allocator &allocator, vector<AllocatedData> &buffers, vector<Vector> &vectors) {
@@ -478,20 +477,18 @@ uint8_t JoinHashTable::GetDictSurvivingIndexWidth(idx_t build_col_idx, const Vec
 	if (ColumnReferencedByResidual(build_col_idx)) {
 		return 0;
 	}
-	// the first chunk must actually arrive as a pipeline-global dictionary
 	if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
 		return 0;
 	}
 	if (!DictionaryVector::IsPipelineGlobal(incoming)) {
 		return 0;
 	}
-	// choose the index width from the dictionary size; an empty dictionary keeps native width
+	// an empty/invalid dictionary keeps native width
 	const auto dict_size = DictionaryVector::DictionarySize(incoming);
 	if (!dict_size.IsValid()) {
 		return 0;
 	}
-	// only narrow when the index is strictly smaller than the native slot (never regress); this also admits
-	// e.g. a 4-byte INTEGER over a D <= 256 dictionary, narrowing it to 1 byte
+	// only narrow when strictly smaller than the native slot (never regress; e.g. INTEGER over a D<=256 dict -> 1 byte)
 	const uint8_t index_width = DictIndexWidth(dict_size.GetIndex());
 	const auto native_bytes = GetTypeIdSize(type.InternalType());
 	if (index_width >= native_bytes) {
@@ -536,19 +533,17 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 	}
 	idx_t col_offset = keys.ColumnCount();
 	D_ASSERT(build_types.size() == payload.ColumnCount());
-	// Scratch index vectors for dict-surviving columns, materialised lazily. Their bytes are allocated through
-	// the JHT's buffer manager (not the default allocator) so the scratch is accounted; dict_idx_buffers owns
-	// the allocations and dict_idx_vectors holds flat views referenced into source_chunk. Both outlive the
-	// ToUnifiedFormat / AppendUnified calls below and are recycled when Build returns.
+	// Scratch index vectors for narrowed columns. Allocated via the buffer manager (accounted, unlike the
+	// default allocator); buffers own the bytes, vectors are flat views into source_chunk. Both must outlive
+	// the ToUnifiedFormat / AppendUnified calls below.
 	vector<AllocatedData> dict_idx_buffers;
 	vector<Vector> dict_idx_vectors;
 	for (idx_t i = 0; i < payload.ColumnCount(); i++) {
 		auto &incoming = payload.data[i];
 		const uint8_t index_width = i < dict_index_width.size() ? dict_index_width[i] : 0;
 		if (index_width != 0) {
-			// The slot was narrowed on the first chunk, so there is no fallback if a later chunk arrives
-			// non-dict. Throw rather than D_ASSERT: in release the Cast<DictionaryBuffer> below is undefined
-			// behaviour on a non-dict vector, silently scattering foreign bytes as indices.
+			// Slot was narrowed on the first chunk; no fallback for a non-dict later chunk. Throw, not D_ASSERT:
+			// the Cast<DictionaryBuffer> below is UB in release on a non-dict vector, scattering foreign bytes.
 			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(incoming).empty() || !DictionaryVector::IsPipelineGlobal(incoming)) {
 				throw InternalException("dict-surviving join: narrowed column %llu received a "
@@ -558,16 +553,14 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			// Pin the dictionary on the first chunk; enforce id continuity on subsequent chunks
 			auto entry_ptr = incoming.BufferMutable().Cast<DictionaryBuffer>().GetEntryPtr();
 			if (!dict_registry[i]) {
-				// The upstream child is filled by a zero-copy gather, so its long strings still point into
-				// the producer's row-store heap, which is recycled before we gather on the probe side. Pin a
-				// self-owned deep copy so the child outlives the producer, preserving id and pipeline_global.
+				// The upstream child comes from a zero-copy gather: its long strings point into the producer's
+				// row-store heap, recycled before we gather on probe. Deep-copy into a self-owned entry so the
+				// child outlives the producer.
 				const auto &upstream_child = entry_ptr->data;
 				const auto child_count = upstream_child.size();
-				// The publisher chose index_width from the dictionary size on the first chunk. A pipeline-global
-				// producer wraps one child across every chunk, so child_count fits index_width by construction;
-				// assert it (1 << 8*width is the width's index capacity: 256 / 65536 / 2^32) so a future producer
-				// that grew the child past the published width fails loudly here rather than letting the
-				// UnsafeNumericCast below silently truncate the indices.
+				// child_count fits index_width by construction (publisher sized it to this dict). Assert it so a
+				// future producer that grows the child past the published width fails loudly instead of silently
+				// truncating in the UnsafeNumericCast below (1 << 8*width is the width's index capacity).
 				D_ASSERT(child_count <= (idx_t(1) << (8 * index_width)));
 				auto owned_entry =
 				    DictionaryVector::CreateReusablePipelineGlobalDictionary(upstream_child.GetType(), child_count);
@@ -581,9 +574,6 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 				// mismatch is a producer bug (never user-triggerable), so assert rather than throw.
 				D_ASSERT(dict_registry[i]->id == entry_ptr->id);
 			}
-			// Materialise a flat unsigned-int vector of the chosen width. Each index fits the width by
-			// construction (the publisher chose it from the dictionary size), so UnsafeNumericCast skips
-			// the per-row bounds check.
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
 			auto &index_allocator = buffer_manager.GetBufferAllocator();
 			switch (index_width) {
@@ -1621,11 +1611,8 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 		auto &vector = result.data[rhs_col_offset + col_idx];
 		const auto output_col_idx = output_columns[col_idx];
 
-		// dict-surviving column: emit the upstream pipeline-global dictionary directly. The layout is
-		// [condition_types, build_types, (found), hash], so build-payload columns map to layout indices
-		// >= cond_count; a join key surfaced as an output column maps below cond_count and is never pinned in
-		// dict_registry. Guard the subtraction explicitly so it cannot underflow idx_t into a spuriously large
-		// payload_idx (which would happen to miss the dict_registry bound, but only by unsigned wraparound).
+		// Pinned column: re-emit the upstream dictionary. Layout is [conditions, build, (found), hash], so payload
+		// columns sit at layout index >= cond_count; guard the subtraction so it cannot underflow into a spurious idx.
 		if (output_col_idx >= cond_count) {
 			const idx_t payload_idx = output_col_idx - cond_count;
 			if (payload_idx < dict_registry.size() && dict_registry[payload_idx]) {

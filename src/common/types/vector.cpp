@@ -188,7 +188,7 @@ void Vector::Reinterpret(const Vector &other) {
 		new_vector.Reinterpret(DictionaryVector::Child(other));
 		auto &old_dict = buffer->Cast<DictionaryBuffer>();
 		auto new_entry = make_shared_ptr<DictionaryEntry>(std::move(new_vector));
-		// preserve the pipeline-global lifetime class across the reinterpret
+		// reinterpret re-mints the entry, so carry the flag across by hand
 		new_entry->pipeline_global = old_dict.GetEntry().pipeline_global;
 		buffer = make_buffer<DictionaryBuffer>(old_dict.GetSelVector(), old_dict.Capacity(), std::move(new_entry));
 	}

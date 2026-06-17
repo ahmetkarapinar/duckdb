@@ -425,14 +425,11 @@ static bool ChunkHasPipelineGlobalDict(const DataChunk &chunk) {
 	return false;
 }
 
-//! Switch the (empty) cache to dictionary mode for every pipeline-global dict column: pin the
-//! upstream entry, allocate its sel accumulator, and rebuild the flat cache with a placeholder slot
-//! for each such column so dict and flat columns stay row-aligned.
-//! Seeding is first-chunk-only (the caller gates it on an empty cache, see AppendToCache), so a column's
-//! State A/B tag is frozen for the whole fill. Unlike the join sink, the caching operator has no B-gate of
-//! its own: correctness depends on the upstream pipeline-global producer emitting the dictionary uniformly
-//! on every chunk (the same entry, never a flat fall-through) -- enforced downstream by the release-active
-//! throw in AppendToCache's State-B branch.
+//! Switch the empty cache to dictionary mode for each pipeline-global dict column: pin the upstream entry,
+//! allocate its sel accumulator, and make its flat cache slot a zero-width placeholder so dict and flat columns
+//! stay row-aligned. A column's dict/flat tag is frozen on this first chunk; correctness then relies on the
+//! producer emitting the same entry on every chunk, never falling back to flat (enforced by the throw in
+//! AppendToCache).
 static void SeedDictCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
 	const idx_t col_count = source.ColumnCount();
 	state.dict_columns.clear();
@@ -453,9 +450,8 @@ static void SeedDictCache(CachingOperatorState &state, DataChunk &source, Client
 	state.dict_cache_active = true;
 }
 
-//! Append source into the cache. Lazily creates it, and on the first append into an empty cache
-//! detects pipeline-global dict columns. Flat columns append as before; dict columns concatenate
-//! their selection indices instead of flattening.
+//! Append source into the cache (created lazily). On the first append into an empty cache, detect
+//! pipeline-global dict columns; those concatenate their selection indices instead of flattening.
 static void AppendToCache(CachingOperatorState &state, DataChunk &source, ClientContext &client_context) {
 	if (!state.cached_chunk) {
 		state.cached_chunk = make_uniq<DataChunk>();
@@ -466,25 +462,22 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 		SeedDictCache(state, source, client_context);
 	}
 	if (!state.dict_cache_active) {
-		// no dict columns: identical to the previous behaviour
+		// no dict columns: plain flat append
 		cache.Append(source);
 		return;
 	}
 	const idx_t base = cache.size();
 	const idx_t added = source.size();
-	// State B accumulates indices into accumulated_sel, sized STANDARD_VECTOR_SIZE in SeedDictCache. The FSM's
-	// has_space_for_chunk_in_cache gate (SelectExecutionMode) guarantees base + added <= STANDARD_VECTOR_SIZE, so
-	// the per-row set_index loop below stays in bounds. Assert it -- unlike the State-A flat Append, which throws
-	// via ERROR_ON_NO_SPACE, the State-B accumulation has no built-in overrun guard, so a future FSM edit that
-	// over-appends must fail loudly here instead of overrunning the selection vector.
+	// accumulated_sel is sized STANDARD_VECTOR_SIZE; the FSM's has_space_for_chunk_in_cache gate guarantees
+	// base + added stays within it. Assert it -- the index accumulation has no overrun guard of its own (unlike
+	// the flat Append's ERROR_ON_NO_SPACE), so a future FSM edit that over-appends must fail loudly here.
 	D_ASSERT(base + added <= STANDARD_VECTOR_SIZE);
 	for (idx_t col_idx = 0; col_idx < cache.ColumnCount(); col_idx++) {
 		auto &slot = state.dict_columns[col_idx];
 		if (slot.entry) {
-			// dict column: every subsequent chunk must arrive as the same pipeline-global dictionary. Like
-			// the join sink's Build pre-pass, throw (not D_ASSERT) before the unchecked Cast<DictionaryBuffer>
-			// below: in release that cast on a non-dict vector is UB that would accumulate foreign bytes as
-			// selection indices.
+			// dict column: every later chunk must arrive as the same pipeline-global dictionary. Throw, not
+			// D_ASSERT, before the unchecked Cast below: in release that cast on a non-dict vector is UB
+			// accumulating foreign bytes as selection indices.
 			auto &source_col = source.data[col_idx];
 			if (source_col.GetVectorType() != VectorType::DICTIONARY_VECTOR ||
 			    DictionaryVector::DictionaryId(source_col).empty() || !DictionaryVector::IsPipelineGlobal(source_col)) {
@@ -500,9 +493,8 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 				slot.accumulated_sel.set_index(base + row, source_sel.get_index(row));
 			}
 		} else {
-			// flat column: append exactly like DataChunk::Append does per column. A State-B column is a
-			// zero-width placeholder and must never reach this flat Append, so assert it has no pinned entry
-			// to catch a future refactor that decouples the branch condition above from the append.
+			// flat column: append per column like DataChunk::Append. A dict column is a zero-width placeholder
+			// and must never reach here, so assert no pinned entry to catch a refactor that decouples this branch.
 			D_ASSERT(!slot.entry);
 			FlatVector::SetSize(cache.data[col_idx], base);
 			cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);
@@ -523,8 +515,8 @@ static void RewrapDictColumns(CachingOperatorState &state, DataChunk &chunk, idx
 	}
 }
 
-//! Move the cache into chunk (reconstructing dict columns) and re-initialize an empty flat cache
-//! for the next batch. With no dict columns this is byte-identical to the previous flush.
+//! Move the cache into chunk (reconstructing dict columns) and re-initialize an empty cache for the next
+//! batch. With no dict columns this is the plain flat flush.
 static void FlushCacheToChunk(CachingOperatorState &state, DataChunk &chunk, ClientContext &client_context) {
 	if (!state.dict_cache_active) {
 		chunk.Move(*state.cached_chunk);
@@ -570,12 +562,10 @@ OperatorResultType CachingPhysicalOperator::Execute(ExecutionContext &context, D
 
 	const auto execution_mode = SelectExecutionMode(chunk, child_result, state);
 
-	// Cache appends and flushes MUST go through AppendToCache / FlushCacheToChunk (which call RewrapDictColumns).
-	// A raw cached_chunk->Append would flatten a State-B pipeline-global dict placeholder (a zero-width column)
-	// and corrupt the chunk size; a raw flush that Moves the cache out without RewrapDictColumns drops the dict.
-	// Any new FSM mode added below must route its append/flush through these helpers. (The continuation case
-	// below does Move a *fresh* incoming chunk back into cached_chunk -- that is a full replacement after the
-	// cache was already flushed+reset, not an append, and carries any raw dict columns through verbatim.)
+	// Appends and flushes MUST go through AppendToCache / FlushCacheToChunk: a raw Append would flatten a
+	// zero-width dict placeholder and corrupt the chunk size, and a raw flush would drop the dict. Any new FSM
+	// mode must route through these helpers. (The continuation case below Moves a fresh chunk in -- a full
+	// replacement after flush+reset, not an append, so raw dict columns pass through verbatim.)
 	switch (execution_mode) {
 	case CachingPhysicalOperatorExecuteMode::RETURN_CACHED_APPEND_CHUNK: {
 		auto tmp = make_uniq<DataChunk>();
