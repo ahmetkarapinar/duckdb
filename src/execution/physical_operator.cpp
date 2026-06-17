@@ -447,6 +447,10 @@ static void SeedDictCache(CachingOperatorState &state, DataChunk &source, Client
 	// dict columns become zero-width placeholders in cached_chunk; the dict lives in the accumulator
 	state.cached_chunk->Destroy();
 	state.cached_chunk->Initialize(Allocator::Get(client_context), source.GetTypes(), flat_initialize);
+	// The freshly seeded cache is empty. When every column is a dict placeholder there is no flat vector to
+	// derive a cardinality from, so set the count explicitly (optional_idx contract) before AppendToCache reads
+	// cache.size().
+	state.cached_chunk->SetChildCardinality(0);
 	state.dict_cache_active = true;
 }
 
