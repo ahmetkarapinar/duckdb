@@ -135,6 +135,16 @@ OperatorResultType CrossProductExecutor::Execute(const DataChunk &input, DataChu
 	auto &constant_chunk = scan_input_chunk ? scan_chunk : input;
 	auto col_count = constant_chunk.ColumnCount();
 	auto col_offset = scan_input_chunk ? input.ColumnCount() : 0;
+	// A reused output chunk may still hold a DICTIONARY_VECTOR left by a prior dict-emitting iteration (e.g. a
+	// recursive-CTE caching-operator flush whose null vector-cache slot DataChunk::Reset cannot flatten). The
+	// stale columns are fully overwritten by the references below, but SetChildCardinality cannot resize a
+	// non-flat/constant vector, so reset them to flat first.
+	for (auto &v : output.data) {
+		auto vtype = v.GetVectorType();
+		if (vtype != VectorType::FLAT_VECTOR && vtype != VectorType::CONSTANT_VECTOR) {
+			v.Initialize();
+		}
+	}
 	output.SetChildCardinality(constant_chunk.size());
 	for (idx_t i = 0; i < col_count; i++) {
 		output.data[col_offset + i].Reference(constant_chunk.data[i]);
