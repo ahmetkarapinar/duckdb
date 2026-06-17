@@ -412,6 +412,94 @@ static idx_t FilterNullValues(UnifiedVectorFormat &vdata, const SelectionVector 
 	return result_count;
 }
 
+// A dictionary of D slots uses indices 0..D-1, so D slots address into a width of W bytes iff D <= 2^(8*W).
+static constexpr idx_t DICT_INDEX_UINT8_CAPACITY = 256;    // 2^8  values fit in a uint8
+static constexpr idx_t DICT_INDEX_UINT16_CAPACITY = 65536; // 2^16 values fit in a uint16
+
+//! Narrowest unsigned-integer byte width that can hold any index into a dictionary of dict_size slots
+static uint8_t DictIndexWidth(idx_t dict_size) {
+	if (dict_size <= DICT_INDEX_UINT8_CAPACITY) {
+		return sizeof(uint8_t);
+	}
+	if (dict_size <= DICT_INDEX_UINT16_CAPACITY) {
+		return sizeof(uint16_t);
+	}
+	return sizeof(uint32_t);
+}
+
+//! Materialise a flat unsigned-int index vector of width INDEX_T over a buffer-manager allocation (owned by
+//! `buffers`, viewed by `vectors`), copying the dictionary sel index into each row. UnsafeNumericCast skips
+//! the per-row bounds check: the publisher chose the width from the dictionary size, so every index fits.
+template <class INDEX_T>
+static void ScatterDictIndices(const SelectionVector &dict_sel, idx_t count, const LogicalType &index_type,
+                               Allocator &allocator, vector<AllocatedData> &buffers, vector<Vector> &vectors) {
+	buffers.emplace_back(allocator.Allocate(count * sizeof(INDEX_T)));
+	vectors.emplace_back(index_type, buffers.back().get(), count);
+	auto idx_data = FlatVector::GetDataMutable<INDEX_T>(vectors.back());
+	for (idx_t r = 0; r < count; r++) {
+		idx_data[r] = UnsafeNumericCast<INDEX_T>(dict_sel.get_index(r));
+	}
+}
+
+//! Load the per-match dict index (width INDEX_T) from each matched row's slot at col_offset into build_sel_vec
+template <class INDEX_T>
+static void LoadDictIndices(const data_ptr_t *ptrs, const SelectionVector &ptr_sel, idx_t count, idx_t col_offset,
+                            SelectionVector &build_sel_vec) {
+	for (idx_t i = 0; i < count; i++) {
+		build_sel_vec.set_index(i, Load<INDEX_T>(ptrs[ptr_sel.get_index(i)] + col_offset));
+	}
+}
+
+bool JoinHashTable::ColumnReferencedByResidual(idx_t build_col_idx) const {
+	if (!residual_info) {
+		return false;
+	}
+	const auto layout_col = condition_types.size() + build_col_idx;
+	for (const auto &kv : residual_info->build_input_to_layout_map) {
+		if (kv.second == layout_col) {
+			return true;
+		}
+	}
+	return false;
+}
+
+uint8_t JoinHashTable::GetDictSurvivingIndexWidth(idx_t build_col_idx, const Vector &incoming) const {
+	const auto &type = build_types[build_col_idx];
+	// Vector::Dictionary rejects nested types
+	switch (type.InternalType()) {
+	case PhysicalType::STRUCT:
+	case PhysicalType::LIST:
+	case PhysicalType::ARRAY:
+		return 0;
+	default:
+		break;
+	}
+	// residual predicates read from the row slot directly; a narrowed slot would corrupt them
+	if (ColumnReferencedByResidual(build_col_idx)) {
+		return 0;
+	}
+	// the first chunk must actually arrive as a pipeline-global dictionary
+	if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
+		return 0;
+	}
+	if (!DictionaryVector::IsPipelineGlobal(incoming)) {
+		return 0;
+	}
+	// choose the index width from the dictionary size; an empty dictionary keeps native width
+	const auto dict_size = DictionaryVector::DictionarySize(incoming);
+	if (!dict_size.IsValid()) {
+		return 0;
+	}
+	// only narrow when the index is strictly smaller than the native slot (never regress); this also admits
+	// e.g. a 4-byte INTEGER over a D <= 256 dictionary, narrowing it to 1 byte
+	const uint8_t index_width = DictIndexWidth(dict_size.GetIndex());
+	const auto native_bytes = GetTypeIdSize(type.InternalType());
+	if (index_width >= native_bytes) {
+		return 0;
+	}
+	return index_width;
+}
+
 void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChunk &keys, DataChunk &payload) {
 	D_ASSERT(!finalized);
 	D_ASSERT(keys.size() == payload.size());
@@ -499,33 +587,18 @@ void JoinHashTable::Build(PartitionedTupleDataAppendState &append_state, DataChu
 			const auto &dict_sel = DictionaryVector::SelVector(incoming);
 			auto &index_allocator = buffer_manager.GetBufferAllocator();
 			switch (index_width) {
-			case sizeof(uint8_t): {
-				dict_idx_buffers.emplace_back(index_allocator.Allocate(payload.size() * sizeof(uint8_t)));
-				dict_idx_vectors.emplace_back(LogicalType::UTINYINT, dict_idx_buffers.back().get(), payload.size());
-				auto idx_data = FlatVector::GetDataMutable<uint8_t>(dict_idx_vectors.back());
-				for (idx_t r = 0; r < payload.size(); r++) {
-					idx_data[r] = UnsafeNumericCast<uint8_t>(dict_sel.get_index(r));
-				}
+			case sizeof(uint8_t):
+				ScatterDictIndices<uint8_t>(dict_sel, payload.size(), LogicalType::UTINYINT, index_allocator,
+				                            dict_idx_buffers, dict_idx_vectors);
 				break;
-			}
-			case sizeof(uint16_t): {
-				dict_idx_buffers.emplace_back(index_allocator.Allocate(payload.size() * sizeof(uint16_t)));
-				dict_idx_vectors.emplace_back(LogicalType::USMALLINT, dict_idx_buffers.back().get(), payload.size());
-				auto idx_data = FlatVector::GetDataMutable<uint16_t>(dict_idx_vectors.back());
-				for (idx_t r = 0; r < payload.size(); r++) {
-					idx_data[r] = UnsafeNumericCast<uint16_t>(dict_sel.get_index(r));
-				}
+			case sizeof(uint16_t):
+				ScatterDictIndices<uint16_t>(dict_sel, payload.size(), LogicalType::USMALLINT, index_allocator,
+				                             dict_idx_buffers, dict_idx_vectors);
 				break;
-			}
-			default: {
-				dict_idx_buffers.emplace_back(index_allocator.Allocate(payload.size() * sizeof(uint32_t)));
-				dict_idx_vectors.emplace_back(LogicalType::UINTEGER, dict_idx_buffers.back().get(), payload.size());
-				auto idx_data = FlatVector::GetDataMutable<uint32_t>(dict_idx_vectors.back());
-				for (idx_t r = 0; r < payload.size(); r++) {
-					idx_data[r] = UnsafeNumericCast<uint32_t>(dict_sel.get_index(r));
-				}
+			default:
+				ScatterDictIndices<uint32_t>(dict_sel, payload.size(), LogicalType::UINTEGER, index_allocator,
+				                             dict_idx_buffers, dict_idx_vectors);
 				break;
-			}
 			}
 			source_chunk.data[col_offset + i].Reference(dict_idx_vectors.back());
 		} else {
@@ -1562,19 +1635,13 @@ void JoinHashTable::GatherRHS(Vector &row_ptrs, const SelectionVector &ptr_sel, 
 				const uint8_t index_width = payload_idx < dict_index_width.size() ? dict_index_width[payload_idx] : 0;
 				switch (index_width) {
 				case sizeof(uint8_t):
-					for (idx_t i = 0; i < count; i++) {
-						build_sel_vec.set_index(i, Load<uint8_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
-					}
+					LoadDictIndices<uint8_t>(ptrs, ptr_sel, count, col_offset, build_sel_vec);
 					break;
 				case sizeof(uint16_t):
-					for (idx_t i = 0; i < count; i++) {
-						build_sel_vec.set_index(i, Load<uint16_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
-					}
+					LoadDictIndices<uint16_t>(ptrs, ptr_sel, count, col_offset, build_sel_vec);
 					break;
 				default:
-					for (idx_t i = 0; i < count; i++) {
-						build_sel_vec.set_index(i, Load<uint32_t>(ptrs[ptr_sel.get_index(i)] + col_offset));
-					}
+					LoadDictIndices<uint32_t>(ptrs, ptr_sel, count, col_offset, build_sel_vec);
 					break;
 				}
 				vector.Dictionary(dict_registry[payload_idx], build_sel_vec, count);

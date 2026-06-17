@@ -233,6 +233,14 @@ public:
 		return layout_ptr.get() != nullptr;
 	}
 
+	//! Per-column eligibility + index-width decision for the dict-surviving optimisation, consulted by the
+	//! layout publisher on the first build chunk. Given a build payload column index and the vector actually
+	//! arriving for it, returns the narrowed row-store index byte width (1/2/4), or 0 to keep the native width.
+	//! Encapsulates the per-column algorithm (nested-type/residual exclusion, pipeline-global dictionary
+	//! detection, dictionary-size width choice, never-regress check); the join-level shape gate stays in the
+	//! operator.
+	uint8_t GetDictSurvivingIndexWidth(idx_t build_col_idx, const Vector &incoming) const;
+
 	//! Add the given data to the HT
 	void Build(PartitionedTupleDataAppendState &append_state, DataChunk &keys, DataChunk &input);
 	//! Merge another HT into this one
@@ -609,6 +617,10 @@ public:
 	void ProbeAndSpill(ScanStructure &scan_structure, DataChunk &probe_keys, TupleDataChunkState &key_state,
 	                   ProbeState &probe_state, DataChunk &probe_chunk, ProbeSpill &probe_spill,
 	                   ProbeSpillLocalAppendState &spill_state, DataChunk &spill_chunk);
+
+private:
+	//! True iff the residual predicate (if any) reads build payload column build_col_idx from its row slot
+	bool ColumnReferencedByResidual(idx_t build_col_idx) const;
 
 private:
 	//! The current number of radix bits used to partition

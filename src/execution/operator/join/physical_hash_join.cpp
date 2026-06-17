@@ -540,22 +540,8 @@ public:
 	}
 };
 
-// A dictionary of D slots uses indices 0..D-1, so D slots address into a width of W bytes iff D <= 2^(8*W).
-static constexpr idx_t DICT_INDEX_UINT8_CAPACITY = 256;    // 2^8  values fit in a uint8
-static constexpr idx_t DICT_INDEX_UINT16_CAPACITY = 65536; // 2^16 values fit in a uint16
-
-//! Narrowest unsigned-integer byte width that can hold any index into a dictionary of dict_size slots
-static uint8_t DictIndexWidth(idx_t dict_size) {
-	if (dict_size <= DICT_INDEX_UINT8_CAPACITY) {
-		return sizeof(uint8_t);
-	}
-	if (dict_size <= DICT_INDEX_UINT16_CAPACITY) {
-		return sizeof(uint16_t);
-	}
-	return sizeof(uint32_t);
-}
-
-//! Row-store slot type for a dict index of the given byte width
+//! Row-store slot type for a dict index of the given byte width (the per-column width itself is decided by
+//! JoinHashTable::GetDictSurvivingIndexWidth; this only maps it to the layout slot type)
 static LogicalType DictIndexType(uint8_t index_width) {
 	switch (index_width) {
 	case sizeof(uint8_t):
@@ -606,20 +592,6 @@ static bool CanUseDictSurvivingJoin(const PhysicalHashJoin &op, const JoinHashTa
 	return true;
 }
 
-//! True iff the residual predicate (if any) reads the column at the given build_types index
-static bool ColumnReferencedByResidual(const JoinHashTable &ht, idx_t build_col_idx) {
-	if (!ht.residual_info) {
-		return false;
-	}
-	const auto layout_col = ht.condition_types.size() + build_col_idx;
-	for (const auto &kv : ht.residual_info->build_input_to_layout_map) {
-		if (kv.second == layout_col) {
-			return true;
-		}
-	}
-	return false;
-}
-
 bool HashJoinGlobalSinkState::DictSurvivingActive() const {
 	if (!hash_table) {
 		return false;
@@ -646,45 +618,15 @@ void HashJoinGlobalSinkState::PublishLayoutIfFirst(HashJoinLocalSinkState &lstat
 	layout_gate.dict_index_width.assign(build_types.size(), 0);
 
 	if (CanUseDictSurvivingJoin(op, *lstate.hash_table, external, can_use_perfect_hash, build_side_multi_source)) {
+		// The join-level gate above is operator/sink state; the per-column width decision is algorithm and
+		// lives on the JoinHashTable (GetDictSurvivingIndexWidth). The publisher only supplies the vector
+		// actually arriving for each column and records the chosen width.
 		for (idx_t col = 0; col < build_types.size(); col++) {
-			const auto &type = build_types[col];
-			// Vector::Dictionary rejects nested types
-			switch (type.InternalType()) {
-			case PhysicalType::STRUCT:
-			case PhysicalType::LIST:
-			case PhysicalType::ARRAY:
-				continue;
-			default:
-				break;
-			}
-			// residual predicates read from the row slot directly; a narrowed slot would corrupt them
-			if (ColumnReferencedByResidual(*lstate.hash_table, col)) {
-				continue;
-			}
-			// the first chunk must actually arrive as a pipeline-global dictionary
 			if (col >= payload_chunk.ColumnCount()) {
 				continue;
 			}
-			auto &incoming = payload_chunk.data[col];
-			if (incoming.GetVectorType() != VectorType::DICTIONARY_VECTOR) {
-				continue;
-			}
-			if (!DictionaryVector::IsPipelineGlobal(incoming)) {
-				continue;
-			}
-			// choose the index width from the dictionary size; an empty dictionary keeps native width
-			const auto dict_size = DictionaryVector::DictionarySize(incoming);
-			if (!dict_size.IsValid()) {
-				continue;
-			}
-			// only narrow when the index is strictly smaller than the native slot (never regress); this
-			// also admits e.g. a 4-byte INTEGER over a D <= 256 dictionary, narrowing it to 1 byte
-			const uint8_t index_width = DictIndexWidth(dict_size.GetIndex());
-			const auto native_bytes = GetTypeIdSize(type.InternalType());
-			if (index_width >= native_bytes) {
-				continue;
-			}
-			layout_gate.dict_index_width[col] = index_width;
+			layout_gate.dict_index_width[col] =
+			    lstate.hash_table->GetDictSurvivingIndexWidth(col, payload_chunk.data[col]);
 		}
 	}
 
