@@ -498,7 +498,8 @@ static void AppendToCache(CachingOperatorState &state, DataChunk &source, Client
 			cache.data[col_idx].Append(source.data[col_idx], added, VectorAppendMode::ERROR_ON_NO_SPACE);
 		}
 	}
-	cache.SetCardinality(base + added);
+	// dict columns are null-buffer placeholders, flat columns already sized; only sets the cardinality
+	cache.SetChildCardinality(base + added);
 }
 
 //! After moving the cache into chunk, re-wrap each dict column as a DICTIONARY_VECTOR over the
